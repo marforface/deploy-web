@@ -2266,6 +2266,104 @@ cf_remove_site() {
   fi
 }
 
+cf_delete_tunnel() {
+  cf_require_installed || return 1
+  msg_section "Eliminar tunnel completo de Cloudflare"
+
+  local tunnels=()
+  mapfile -t tunnels < <(cloudflared tunnel list 2>/dev/null | awk 'NR>1 && NF>=2 {print $1" "$2}')
+
+  if [[ "${#tunnels[@]}" -eq 0 ]]; then
+    msg_warn "No hay tunnels en tu cuenta."; return 0
+  fi
+
+  echo "  Tunnels existentes en tu cuenta:"; echo
+  local i=1 uuids=() names=()
+  for t in "${tunnels[@]}"; do
+    local u n
+    u="$(awk '{print $1}' <<< "$t")"
+    n="$(awk '{print $2}' <<< "$t")"
+    uuids+=("$u"); names+=("$n")
+    printf "  %d) %-26s %s\n" "$i" "$n" "$u"
+    ((i++))
+  done
+  echo "  0) Cancelar"; echo
+
+  local opt
+  read -rp "  Tunnel a eliminar: " opt
+  [[ "$opt" == "0" ]] && return 0
+  if ! [[ "$opt" =~ ^[0-9]+$ ]] || (( opt < 1 || opt > ${#uuids[@]} )); then
+    msg_error "Opción inválida."; return 1
+  fi
+
+  local del_uuid="${uuids[$((opt-1))]}"
+  local del_name="${names[$((opt-1))]}"
+  echo
+  msg_info "Tunnel seleccionado: ${del_name} (${del_uuid})"
+  echo
+
+  # Verificar sitios vinculados en el config.yml activo
+  local linked_hosts=() is_active_config="n"
+  if [[ -f "$CLOUDFLARED_CONFIG" ]]; then
+    local cfg_uuid
+    cfg_uuid="$(awk '/^tunnel:/ {print $2}' "$CLOUDFLARED_CONFIG")"
+    if [[ "$cfg_uuid" == "$del_uuid" ]]; then
+      is_active_config="s"
+      mapfile -t linked_hosts < <(awk '/^  - hostname:/ {print $3}' "$CLOUDFLARED_CONFIG")
+    fi
+  fi
+
+  if [[ "${#linked_hosts[@]}" -gt 0 ]]; then
+    msg_warn "Este tunnel tiene ${#linked_hosts[@]} sitio(s) vinculado(s) en config.yml:"
+    for h in "${linked_hosts[@]}"; do echo "      - $h"; done
+    echo
+    msg_warn "Si lo eliminas, estos sitios dejarán de ser accesibles vía Cloudflare."
+    prompt_yes_no "¿Eliminar el tunnel de todas formas?" "n"
+    [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado."; return 0; }
+    echo
+  else
+    msg_ok "No se detectaron sitios vinculados a este tunnel en config.yml."
+    echo
+  fi
+
+  prompt_yes_no "¿Confirmar eliminación DEFINITIVA del tunnel '${del_name}'?" "n"
+  [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado."; return 0; }
+
+  # Si es el tunnel activo, detener el servicio antes de eliminar
+  local was_running="n"
+  if [[ "$is_active_config" == "s" ]] && cf_running; then
+    was_running="s"
+    msg_info "Deteniendo servicio cloudflared (usa este tunnel)..."
+    systemctl stop cloudflared 2>/dev/null || true
+  fi
+
+  # -f fuerza la limpieza de conexiones activas antes de borrar
+  msg_info "Eliminando tunnel '${del_name}'..."
+  if cloudflared tunnel delete -f "$del_name" 2>&1; then
+    msg_ok "Tunnel '${del_name}' eliminado de Cloudflare."
+  else
+    msg_error "No se pudo eliminar el tunnel (¿conexiones activas o credenciales faltantes?)."
+    [[ "$was_running" == "s" ]] && systemctl start cloudflared 2>/dev/null || true
+    return 1
+  fi
+
+  # Limpiar credenciales locales del tunnel eliminado
+  for f in "/root/.cloudflared/${del_uuid}.json" "${CLOUDFLARED_DIR}/${del_uuid}.json"; do
+    [[ -f "$f" ]] && rm -f "$f" && msg_warn "Credenciales eliminadas: ${f}"
+  done
+
+  echo
+  if [[ "$is_active_config" == "s" ]]; then
+    msg_warn "El config.yml apuntaba a este tunnel y ahora quedó huérfano."
+    msg_warn "Los registros CNAME en Cloudflare DNS deben eliminarse manualmente."
+    echo
+    msg_info "Para crear e incorporar un nuevo tunnel:"
+    echo "      Cloudflare → opción 2 (Autenticar) → opción 3 (Crear tunnel + config.yml)"
+  else
+    msg_info "El config.yml activo no se vio afectado."
+  fi
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ESTADO GENERAL
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2591,6 +2689,121 @@ git_status_site() {
 # SUBMENÚS
 # ══════════════════════════════════════════════════════════════════════════════
 
+uninstall_web_stack() {
+  msg_section "Eliminar TODO el Stack Web (limpiar la máquina)"
+
+  # Inventario de lo que se eliminaría
+  local sites=() php_versions=()
+  mapfile -t sites < <(
+    find /etc/nginx/sites-available -maxdepth 1 -type f -printf '%f\n' 2>/dev/null \
+      | grep -Ev '^default$|^000-catch-all$' | sort
+  )
+  mapfile -t php_versions < <(detect_installed_php_versions)
+
+  echo -e "  ${BOLD}${RED}╔══════════════════════════════════════════════════╗${RESET}"
+  echo -e "  ${BOLD}${RED}║   ⚠  ADVERTENCIA — OPERACIÓN DESTRUCTIVA  ⚠      ║${RESET}"
+  echo -e "  ${BOLD}${RED}╚══════════════════════════════════════════════════╝${RESET}"
+  echo
+  msg_warn "Esta acción eliminará por completo el stack web de esta máquina:"
+  echo
+  echo -e "    ${RED}•${RESET} Nginx (paquete + configuración /etc/nginx)"
+  echo -e "    ${RED}•${RESET} PHP-FPM y todos los paquetes php* instalados"
+  echo -e "    ${RED}•${RESET} Repositorio Sury (/etc/apt/sources.list.d/php.list)"
+  echo -e "    ${RED}•${RESET} Todos los sitios y su contenido en /var/www"
+  echo
+  echo -e "  ${BOLD}Inventario actual detectado:${RESET}"
+  echo
+  if [[ "${#sites[@]}" -gt 0 ]]; then
+    echo -e "    ${YELLOW}Sitios (${#sites[@]}):${RESET}"
+    for s in "${sites[@]}"; do
+      local dir="/var/www/${s}"
+      local sz="—"
+      [[ -d "$dir" ]] && sz="$(du -sh "$dir" 2>/dev/null | cut -f1)"
+      printf "      - %-24s %s\n" "$s" "$dir (${sz})"
+    done
+  else
+    echo -e "    ${DIM}Sin sitios configurados.${RESET}"
+  fi
+  echo
+  if [[ "${#php_versions[@]}" -gt 0 ]]; then
+    echo -e "    ${YELLOW}Versiones PHP-FPM:${RESET} ${php_versions[*]}"
+  else
+    echo -e "    ${DIM}Sin PHP-FPM instalado.${RESET}"
+  fi
+  dpkg -s nginx >/dev/null 2>&1 \
+    && echo -e "    ${YELLOW}Nginx:${RESET} instalado" \
+    || echo -e "    ${DIM}Nginx: no instalado${RESET}"
+  echo
+
+  msg_error "Esta operación NO se puede deshacer. Los datos en /var/www se perderán."
+  echo
+  msg_info "Se recomienda respaldar bases de datos y /var/www antes de continuar."
+  echo
+
+  # Primera confirmación
+  prompt_yes_no "¿Deseas continuar con la eliminación del Stack Web?" "n"
+  [[ "$REPLY_YESNO" != "s" ]] && { msg_ok "Cancelado. No se eliminó nada."; return 0; }
+  echo
+
+  # Preguntar si conserva /var/www
+  prompt_yes_no "¿Eliminar también el contenido de /var/www (sitios y archivos)?" "n"
+  local remove_www="$REPLY_YESNO"
+  echo
+
+  # Segunda confirmación con frase explícita
+  msg_warn "Confirmación final: escribe exactamente  ELIMINAR  para proceder."
+  local phrase=""
+  read -rp "  > " phrase
+  if [[ "$phrase" != "ELIMINAR" ]]; then
+    msg_ok "Frase incorrecta. Operación cancelada. No se eliminó nada."; return 0
+  fi
+  echo
+
+  # ── Ejecución ──────────────────────────────────────────────────────────────
+  msg_info "[1/6] Deteniendo servicios..."
+  systemctl stop nginx 2>/dev/null || true
+  local v
+  for v in "${php_versions[@]}"; do
+    systemctl stop "php${v}-fpm" 2>/dev/null || true
+  done
+
+  msg_info "[2/6] Eliminando sitios de Nginx..."
+  for s in "${sites[@]}"; do
+    cleanup_site_residue "$s" "$remove_www"
+  done
+  rm -f /etc/nginx/sites-enabled/000-catch-all "$CATCH_ALL_FILE" 2>/dev/null || true
+
+  msg_info "[3/6] Purgando paquetes PHP..."
+  local php_pkgs=()
+  mapfile -t php_pkgs < <(dpkg -l 'php*' 2>/dev/null | awk '/^ii/{print $2}')
+  if [[ "${#php_pkgs[@]}" -gt 0 ]]; then
+    apt-get purge -y "${php_pkgs[@]}" 2>/dev/null || true
+  fi
+
+  msg_info "[4/6] Purgando Nginx..."
+  apt-get purge -y nginx nginx-common nginx-core 2>/dev/null || true
+  rm -rf /etc/nginx 2>/dev/null || true
+
+  msg_info "[5/6] Eliminando repositorio Sury..."
+  rm -f /etc/apt/sources.list.d/php.list \
+        /usr/share/keyrings/deb.sury.org-php.gpg 2>/dev/null || true
+
+  msg_info "[6/6] Limpiando dependencias huérfanas..."
+  apt-get autoremove -y 2>/dev/null || true
+  apt-get update 2>/dev/null || true
+
+  # Reset de la versión PHP activa en el script
+  PHP_VERSION=""
+
+  echo
+  msg_ok "Stack Web eliminado."
+  [[ "$remove_www" == "s" ]] \
+    && msg_warn "Contenido de /var/www eliminado." \
+    || msg_info "El contenido de /var/www se conservó."
+  echo
+  msg_info "MariaDB y Cloudflared NO fueron tocados (usa sus menús si deseas eliminarlos)."
+}
+
 header_web_stack() {
   echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
   echo -e "${BOLD}${CYAN}║${WHITE}  [ 1 ] Stack Web — Nginx + PHP             ${CYAN}║${RESET}"
@@ -2618,6 +2831,8 @@ menu_web_stack() {
     echo -e "  ${CYAN}11)${RESET} Configurar duración de sesión PHP"
     echo -e "  ${CYAN}12)${RESET} Estado y versiones PHP"
     echo -e "  ${CYAN}13)${RESET} Cambiar versión PHP activa"
+    menu_cat "Zona de peligro" "$RED"
+    echo -e "  ${RED}14)${RESET} Eliminar TODO el Stack Web (limpiar la máquina)"
     echo
     echo -e "  ${CYAN} 0)${RESET} ← Volver al menú principal"
     echo
@@ -2636,6 +2851,7 @@ menu_web_stack() {
       11) run_item header_web_stack configure_session_lifetime ;;
       12) run_item header_web_stack show_php_status ;;
       13) run_item header_web_stack select_php_version switch ;;
+      14) run_item header_web_stack uninstall_web_stack ;;
       0)  return ;;
       *)  msg_error "Opción inválida."; pause ;;
     esac
@@ -2733,11 +2949,12 @@ menu_cloudflared() {
     echo -e "  ${YELLOW}4)${RESET} Regenerar config.yml desde sitios Nginx"
     echo -e "  ${YELLOW}5)${RESET} Ver config.yml actual"
     echo -e "  ${YELLOW}6)${RESET} Eliminar sitio del tunnel  (solo quita el hostname del config.yml)"
+    echo -e "  ${YELLOW}7)${RESET} Eliminar tunnel completo de Cloudflare"
     menu_cat "Servicio" "$YELLOW"
-    echo -e "  ${YELLOW}7)${RESET} Estado del tunnel"
-    echo -e "  ${YELLOW}8)${RESET} Iniciar / Detener / Reiniciar servicio"
-    echo -e "  ${YELLOW}9)${RESET} Ver logs"
-    echo -e "  ${YELLOW}10)${RESET} Reparar servicio (instalado con --token)"
+    echo -e "  ${YELLOW}8)${RESET} Estado del tunnel"
+    echo -e "  ${YELLOW}9)${RESET} Iniciar / Detener / Reiniciar servicio"
+    echo -e "  ${YELLOW}10)${RESET} Ver logs"
+    echo -e "  ${YELLOW}11)${RESET} Reparar servicio (instalado con --token)"
     echo
     echo -e "  ${YELLOW}0)${RESET} ← Volver al menú principal"
     echo
@@ -2749,10 +2966,11 @@ menu_cloudflared() {
       4)  run_item header_cloudflared cf_regen_config ;;
       5)  run_item header_cloudflared cf_show_config ;;
       6)  run_item header_cloudflared cf_remove_site ;;
-      7)  run_item header_cloudflared cf_status ;;
-      8)  run_item header_cloudflared cf_service_control ;;
-      9)  run_item header_cloudflared cf_logs ;;
-      10) run_item header_cloudflared cf_fix_service ;;
+      7)  run_item header_cloudflared cf_delete_tunnel ;;
+      8)  run_item header_cloudflared cf_status ;;
+      9)  run_item header_cloudflared cf_service_control ;;
+      10) run_item header_cloudflared cf_logs ;;
+      11) run_item header_cloudflared cf_fix_service ;;
       0)  return ;;
       *)  msg_error "Opción inválida."; pause ;;
     esac
