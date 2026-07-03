@@ -2451,6 +2451,437 @@ cf_uninstall() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SEGURIDAD — BLINDAJE DEL ENTORNO
+# ══════════════════════════════════════════════════════════════════════════════
+
+readonly NGINX_SEC_SNIPPET="/etc/nginx/snippets/security-headers.conf"
+
+_detect_ssh_port() {
+  local p
+  p="$(awk '/^[[:space:]]*Port[[:space:]]/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)"
+  echo "${p:-22}"
+}
+
+sec_install_ufw() {
+  msg_section "Firewall UFW"
+
+  if ! command -v ufw >/dev/null 2>&1; then
+    msg_info "Instalando ufw..."
+    apt-get install -y ufw
+  else
+    msg_ok "ufw ya está instalado."
+  fi
+
+  local ssh_port; ssh_port="$(_detect_ssh_port)"
+  echo
+  msg_info "Política propuesta:"
+  echo "      deny  incoming (todo lo entrante bloqueado por defecto)"
+  echo "      allow outgoing"
+  echo "      allow ${ssh_port}/tcp   (SSH)"
+  echo "      allow 80/tcp    (HTTP)"
+  echo "      allow 443/tcp   (HTTPS)"
+  echo
+  msg_info "Nota: si publicas SOLO vía Cloudflare Tunnel, 80/443 pueden cerrarse"
+  msg_info "(el tunnel es conexión saliente y no necesita puertos abiertos)."
+  echo
+
+  prompt_yes_no "¿Abrir 80/443? (responde 'n' si solo usas Cloudflare Tunnel)" "s"
+  local open_web="$REPLY_YESNO"
+
+  local mdb_rule="n" mdb_src=""
+  if mariadb_installed; then
+    prompt_yes_no "¿Permitir acceso remoto a MariaDB (puerto 3306) desde una red/IP?" "n"
+    if [[ "$REPLY_YESNO" == "s" ]]; then
+      read -rp "  Red o IP origen (ej: 192.168.11.0/24): " mdb_src
+      [[ -n "$mdb_src" ]] && mdb_rule="s"
+    fi
+  fi
+
+  echo
+  msg_warn "IMPORTANTE: se permitirá el puerto SSH ${ssh_port} ANTES de activar el firewall"
+  msg_warn "para no cortar tu sesión actual."
+  prompt_yes_no "¿Aplicar y activar UFW ahora?" "s"
+  [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado."; return 0; }
+
+  ufw default deny incoming  >/dev/null
+  ufw default allow outgoing >/dev/null
+  ufw allow "${ssh_port}/tcp" comment 'SSH' >/dev/null
+  if [[ "$open_web" == "s" ]]; then
+    ufw allow 80/tcp  comment 'HTTP'  >/dev/null
+    ufw allow 443/tcp comment 'HTTPS' >/dev/null
+  fi
+  [[ "$mdb_rule" == "s" ]] \
+    && ufw allow from "$mdb_src" to any port 3306 proto tcp comment 'MariaDB LAN' >/dev/null
+
+  ufw --force enable >/dev/null
+  systemctl enable ufw >/dev/null 2>&1 || true
+
+  echo
+  msg_ok "UFW activo. Reglas actuales:"
+  echo
+  ufw status verbose | sed 's/^/    /'
+}
+
+sec_install_fail2ban() {
+  msg_section "Fail2ban — bloqueo de ataques por fuerza bruta"
+
+  if ! dpkg -s fail2ban >/dev/null 2>&1; then
+    msg_info "Instalando fail2ban..."
+    apt-get install -y fail2ban
+  else
+    msg_ok "fail2ban ya está instalado."
+  fi
+
+  local jail_local="/etc/fail2ban/jail.local"
+  [[ -f "$jail_local" ]] && cp "$jail_local" "${jail_local}.bak.$(date +%F-%H%M%S)"
+
+  local ssh_port; ssh_port="$(_detect_ssh_port)"
+
+  cat > "$jail_local" <<EOF
+# Generado por DevLab Manager — $(date +%F)
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+ignoreip = 127.0.0.1/8 ::1
+backend  = systemd
+
+[sshd]
+enabled = true
+port    = ${ssh_port}
+maxretry = 4
+
+[nginx-http-auth]
+enabled  = true
+port     = http,https
+logpath  = /var/log/nginx/*error.log
+
+[nginx-botsearch]
+enabled  = true
+port     = http,https
+logpath  = /var/log/nginx/*access.log
+maxretry = 10
+EOF
+
+  systemctl enable --now fail2ban >/dev/null 2>&1
+  systemctl restart fail2ban
+
+  sleep 1
+  echo
+  msg_ok "fail2ban activo con jails: sshd, nginx-http-auth, nginx-botsearch"
+  echo
+  msg_info "Política: 5 intentos fallidos en 10 min → baneo de 1 hora."
+  echo
+  fail2ban-client status 2>/dev/null | sed 's/^/    /' || true
+  echo
+  msg_info "Comandos útiles:"
+  echo "      fail2ban-client status sshd            # ver IPs baneadas"
+  echo "      fail2ban-client set sshd unbanip <IP>  # desbanear"
+}
+
+sec_harden_ssh() {
+  msg_section "Endurecer SSH"
+
+  local sshd=/etc/ssh/sshd_config
+  [[ ! -f "$sshd" ]] && { msg_warn "OpenSSH server no está instalado."; return 0; }
+
+  local ssh_port; ssh_port="$(_detect_ssh_port)"
+  echo
+  msg_info "Configuración propuesta:"
+  echo "      PermitRootLogin prohibit-password  (root solo con clave SSH, nunca password)"
+  echo "      MaxAuthTries 4"
+  echo "      LoginGraceTime 30"
+  echo "      X11Forwarding no"
+  echo "      ClientAliveInterval 300 / ClientAliveCountMax 2"
+  echo
+  msg_warn "ANTES de aplicar, verifica que puedes entrar por SSH con clave pública."
+  msg_warn "Si solo tienes acceso por contraseña de root, quedarás fuera del servidor"
+  msg_warn "(salvo consola Proxmox/VPS)."
+  echo
+
+  prompt_yes_no "¿Tienes acceso por clave SSH o consola alternativa (Proxmox/panel VPS)?" "n"
+  [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado. Configura una clave SSH primero."; return 0; }
+
+  prompt_yes_no "¿Deshabilitar TAMBIÉN la autenticación por contraseña para TODOS los usuarios?" "n"
+  local no_passwords="$REPLY_YESNO"
+
+  cp "$sshd" "${sshd}.bak.$(date +%F-%H%M%S)"
+
+  _sshd_set() {
+    local key="$1" val="$2"
+    if grep -qE "^[#[:space:]]*${key}[[:space:]]" "$sshd"; then
+      sed -i "s|^[#[:space:]]*${key}[[:space:]].*|${key} ${val}|" "$sshd"
+    else
+      echo "${key} ${val}" >> "$sshd"
+    fi
+  }
+
+  _sshd_set "PermitRootLogin"        "prohibit-password"
+  _sshd_set "MaxAuthTries"           "4"
+  _sshd_set "LoginGraceTime"         "30"
+  _sshd_set "X11Forwarding"          "no"
+  _sshd_set "ClientAliveInterval"    "300"
+  _sshd_set "ClientAliveCountMax"    "2"
+  _sshd_set "PermitEmptyPasswords"   "no"
+  [[ "$no_passwords" == "s" ]] && _sshd_set "PasswordAuthentication" "no"
+
+  if sshd -t 2>/dev/null; then
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
+    msg_ok "SSH endurecido y reiniciado (puerto ${ssh_port})."
+    [[ "$no_passwords" == "s" ]] \
+      && msg_warn "Autenticación por contraseña DESHABILITADA. Solo claves SSH."
+  else
+    msg_error "sshd_config inválido. Restaurando backup..."
+    cp "${sshd}.bak."* "$sshd" 2>/dev/null || true
+    return 1
+  fi
+  echo
+  msg_warn "NO cierres esta sesión: abre OTRA terminal y verifica que puedes conectar."
+}
+
+sec_nginx_headers() {
+  ensure_web_stack_installed || return 1
+  msg_section "Headers de seguridad Nginx"
+
+  install -d -m 0755 /etc/nginx/snippets
+
+  cat > "$NGINX_SEC_SNIPPET" <<'EOF'
+# Generado por DevLab Manager — headers de seguridad
+add_header X-Frame-Options        "SAMEORIGIN"                          always;
+add_header X-Content-Type-Options "nosniff"                             always;
+add_header Referrer-Policy        "strict-origin-when-cross-origin"     always;
+add_header Permissions-Policy     "camera=(), microphone=(), geolocation=()" always;
+add_header X-XSS-Protection       "1; mode=block"                       always;
+EOF
+  msg_ok "Snippet creado: ${NGINX_SEC_SNIPPET}"
+
+  # Ocultar versión de Nginx globalmente
+  if ! grep -q "server_tokens off" /etc/nginx/conf.d/security.conf 2>/dev/null; then
+    echo "server_tokens off;" > /etc/nginx/conf.d/security.conf
+    msg_ok "server_tokens off (versión de Nginx oculta en headers y errores)."
+  fi
+
+  # Incluir el snippet en cada sitio que no lo tenga
+  local sites=() patched=0
+  mapfile -t sites < <(
+    find /etc/nginx/sites-available -maxdepth 1 -type f -printf '%f\n' \
+      | grep -Ev '^default$|^000-catch-all$' | sort
+  )
+  for site in "${sites[@]}"; do
+    local conf="/etc/nginx/sites-available/${site}"
+    if ! grep -q "security-headers.conf" "$conf"; then
+      sed -i "/server_name /a\\    include snippets/security-headers.conf;" "$conf"
+      msg_ok "Headers agregados a: ${site}"
+      ((patched++)) || true
+    else
+      msg_info "${site}: ya incluye los headers."
+    fi
+  done
+
+  if nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx
+    msg_ok "Nginx recargado. Sitios actualizados: ${patched}."
+  else
+    msg_error "nginx -t falló. Revisa la configuración."
+    return 1
+  fi
+  echo
+  msg_info "Verifica con: curl -I https://tudominio.cl"
+}
+
+sec_auto_updates() {
+  msg_section "Actualizaciones de seguridad automáticas"
+
+  if ! dpkg -s unattended-upgrades >/dev/null 2>&1; then
+    msg_info "Instalando unattended-upgrades..."
+    apt-get install -y unattended-upgrades apt-listchanges
+  else
+    msg_ok "unattended-upgrades ya está instalado."
+  fi
+
+  cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+
+  systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
+
+  msg_ok "Actualizaciones de seguridad automáticas habilitadas (diarias)."
+  echo
+  msg_info "Solo se instalan parches de seguridad de Debian; el resto queda manual."
+  msg_info "Log: /var/log/unattended-upgrades/"
+}
+
+sec_audit() {
+  msg_section "Auditoría de seguridad del entorno"
+  local warn_count=0
+
+  _chk() {  # _chk "descripcion" ok|warn "detalle"
+    local desc="$1" state="$2" detail="$3"
+    if [[ "$state" == "ok" ]]; then
+      printf "  ${GREEN}✔${RESET} %-46s %s\n" "$desc" "$detail"
+    else
+      printf "  ${RED}✖${RESET} %-46s ${YELLOW}%s${RESET}\n" "$desc" "$detail"
+      ((warn_count++)) || true
+    fi
+  }
+
+  echo -e "  ${BOLD}── Firewall y red ──${RESET}"
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    _chk "UFW firewall" ok "activo"
+  else
+    _chk "UFW firewall" warn "inactivo o no instalado (Seguridad → 1)"
+  fi
+  if dpkg -s fail2ban >/dev/null 2>&1 && systemctl is-active --quiet fail2ban; then
+    _chk "fail2ban" ok "activo"
+  else
+    _chk "fail2ban" warn "inactivo o no instalado (Seguridad → 2)"
+  fi
+
+  echo; echo -e "  ${BOLD}── SSH ──${RESET}"
+  local prl pauth
+  prl="$(awk '/^PermitRootLogin/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)"
+  pauth="$(awk '/^PasswordAuthentication/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)"
+  case "$prl" in
+    no|prohibit-password) _chk "PermitRootLogin" ok "$prl" ;;
+    yes)                  _chk "PermitRootLogin" warn "yes — root con contraseña (Seguridad → 3)" ;;
+    *)                    _chk "PermitRootLogin" warn "${prl:-default} — revisar" ;;
+  esac
+  [[ "$pauth" == "no" ]] \
+    && _chk "PasswordAuthentication" ok "no (solo claves)" \
+    || _chk "PasswordAuthentication" warn "${pauth:-yes} — contraseñas permitidas"
+
+  echo; echo -e "  ${BOLD}── Nginx ──${RESET}"
+  [[ -f "$NGINX_SEC_SNIPPET" ]] \
+    && _chk "Headers de seguridad" ok "snippet instalado" \
+    || _chk "Headers de seguridad" warn "sin configurar (Seguridad → 4)"
+  grep -rq "server_tokens off" /etc/nginx/ 2>/dev/null \
+    && _chk "server_tokens" ok "off (versión oculta)" \
+    || _chk "server_tokens" warn "versión de Nginx expuesta"
+
+  echo; echo -e "  ${BOLD}── Sitios (archivos sensibles) ──${RESET}"
+  local found_debug=0
+  while IFS= read -r f; do
+    _chk "Archivo de diagnóstico" warn "$f"
+    found_debug=1
+  done < <(find /var/www -maxdepth 3 \( -name "info.php" -o -name "test-db.php" \) 2>/dev/null)
+  [[ $found_debug -eq 0 ]] && _chk "info.php / test-db.php" ok "ninguno expuesto"
+
+  local bad_env=0
+  while IFS= read -r f; do
+    local perms; perms="$(stat -c '%a' "$f" 2>/dev/null)"
+    if [[ "$perms" != "640" && "$perms" != "600" ]]; then
+      _chk "Permisos .env" warn "${f} (${perms})"
+      bad_env=1
+    fi
+  done < <(find /var/www -maxdepth 2 -name ".env" 2>/dev/null)
+  [[ $bad_env -eq 0 ]] && _chk "Permisos .env" ok "correctos (640/600)"
+
+  echo; echo -e "  ${BOLD}── MariaDB ──${RESET}"
+  if mariadb_installed; then
+    local bind
+    bind="$(awk -F'=' '/^bind-address/ {gsub(/ /,"",$2); print $2; exit}' "$MARIADB_CNF" 2>/dev/null)"
+    case "$bind" in
+      127.0.0.1) _chk "bind-address" ok "127.0.0.1 (solo local)" ;;
+      0.0.0.0)   _chk "bind-address" warn "0.0.0.0 — expuesto a todas las interfaces" ;;
+      *)         _chk "bind-address" ok "${bind:-no definido}" ;;
+    esac
+    local anon
+    anon="$(mariadb -sNe "SELECT COUNT(*) FROM mysql.user WHERE User='';" 2>/dev/null || echo '?')"
+    [[ "$anon" == "0" ]] \
+      && _chk "Usuarios anónimos" ok "ninguno" \
+      || _chk "Usuarios anónimos" warn "${anon} — ejecuta mysql_secure_installation"
+    local wide
+    wide="$(mariadb -sNe "SELECT COUNT(*) FROM mysql.user WHERE Host='%' AND User NOT IN ('root','mariadb.sys','mysql');" 2>/dev/null || echo '?')"
+    [[ "$wide" == "0" ]] \
+      && _chk "Usuarios con host %" ok "ninguno" \
+      || _chk "Usuarios con host %" warn "${wide} usuario(s) aceptan conexión desde cualquier IP"
+  else
+    _chk "MariaDB" ok "no instalado en este LXC"
+  fi
+
+  echo; echo -e "  ${BOLD}── Sistema ──${RESET}"
+  dpkg -s unattended-upgrades >/dev/null 2>&1 \
+    && _chk "Actualizaciones automáticas" ok "habilitadas" \
+    || _chk "Actualizaciones automáticas" warn "sin configurar (Seguridad → 5)"
+  local pending
+  pending="$(apt list --upgradable 2>/dev/null | grep -c "security" || true)"
+  [[ "${pending:-0}" -eq 0 ]] \
+    && _chk "Parches de seguridad pendientes" ok "0" \
+    || _chk "Parches de seguridad pendientes" warn "${pending} pendiente(s) — Sistema → 4"
+
+  echo
+  if [[ $warn_count -eq 0 ]]; then
+    echo -e "  ${BOLD}${GREEN}╔══════════════════════════════════════════╗${RESET}"
+    echo -e "  ${BOLD}${GREEN}║   Entorno blindado: 0 advertencias  ✔    ║${RESET}"
+    echo -e "  ${BOLD}${GREEN}╚══════════════════════════════════════════╝${RESET}"
+  else
+    msg_warn "Auditoría completada: ${warn_count} punto(s) por corregir (indicados arriba)."
+  fi
+}
+
+sec_harden_all() {
+  msg_section "Blindaje completo del entorno"
+  echo "  Se aplicarán en secuencia (cada paso pide su propia confirmación):"
+  echo
+  echo "    1. Firewall UFW"
+  echo "    2. fail2ban"
+  echo "    3. Endurecer SSH"
+  echo "    4. Headers de seguridad Nginx"
+  echo "    5. Actualizaciones de seguridad automáticas"
+  echo "    6. Auditoría final"
+  echo
+  prompt_yes_no "¿Comenzar el blindaje completo?" "s"
+  [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado."; return 0; }
+
+  echo; sec_install_ufw       || true
+  echo; sec_install_fail2ban  || true
+  echo; sec_harden_ssh        || true
+  echo; sec_nginx_headers     || true
+  echo; sec_auto_updates      || true
+  echo; sec_audit             || true
+}
+
+header_seguridad() {
+  echo -e "${BOLD}${RED}╔══════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${RED}║${WHITE}  [ 6 ] Seguridad — Blindaje del entorno    ${RED}║${RESET}"
+  echo -e "${BOLD}${RED}╚══════════════════════════════════════════════╝${RESET}"
+}
+
+menu_seguridad() {
+  local opt
+  while true; do
+    clear
+    header_seguridad; echo
+    menu_cat "Protección" "$RED"
+    echo -e "  ${RED}1)${RESET} Firewall UFW  (deny incoming + SSH/HTTP/HTTPS)"
+    echo -e "  ${RED}2)${RESET} fail2ban  (anti fuerza bruta: SSH + Nginx)"
+    echo -e "  ${RED}3)${RESET} Endurecer SSH  (root sin password, límites de intentos)"
+    echo -e "  ${RED}4)${RESET} Headers de seguridad Nginx  (+ ocultar versión)"
+    echo -e "  ${RED}5)${RESET} Actualizaciones de seguridad automáticas"
+    menu_cat "Verificación" "$RED"
+    echo -e "  ${RED}6)${RESET} Auditoría de seguridad  (chequeo completo del entorno)"
+    echo -e "  ${RED}7)${RESET} ${BOLD}Blindaje completo${RESET}  (aplica 1→5 y audita)"
+    echo
+    echo -e "  ${RED}0)${RESET} ← Volver al menú principal"
+    echo
+    read -rp "  Opción: " opt
+    case "$opt" in
+      1) run_item header_seguridad sec_install_ufw ;;
+      2) run_item header_seguridad sec_install_fail2ban ;;
+      3) run_item header_seguridad sec_harden_ssh ;;
+      4) run_item header_seguridad sec_nginx_headers ;;
+      5) run_item header_seguridad sec_auto_updates ;;
+      6) run_item header_seguridad sec_audit ;;
+      7) run_item header_seguridad sec_harden_all ;;
+      0) return ;;
+      *) msg_error "Opción inválida."; pause ;;
+    esac
+  done
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ESTADO GENERAL
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -3195,10 +3626,11 @@ main_menu() {
     echo -e "  ${YELLOW}3)${RESET} ${BOLD}Cloudflare${RESET}     — Tunnel, config, DNS"
     echo -e "  ${GREEN}4)${RESET} ${BOLD}Git / Deploy${RESET}   — Deploy key, clone, pull, post-deploy"
     echo -e "  ${WHITE}5)${RESET} ${BOLD}Sistema${RESET}        — Hora, zona horaria, actualizaciones"
-    echo -e "  ${WHITE}6)${RESET} ${BOLD}Estado${RESET}         — Resumen de servicios"
+    echo -e "  ${RED}6)${RESET} ${BOLD}Seguridad${RESET}      — Firewall, fail2ban, SSH, auditoría"
+    echo -e "  ${WHITE}7)${RESET} ${BOLD}Estado${RESET}         — Resumen de servicios"
     echo -e "  ${WHITE}0)${RESET} Salir"
     echo
-    read -rp "  Selecciona [0-6]: " opt; echo
+    read -rp "  Selecciona [0-7]: " opt; echo
 
     case "$opt" in
       1) menu_web_stack    || true ;;
@@ -3206,7 +3638,8 @@ main_menu() {
       3) menu_cloudflared  || true ;;
       4) menu_git          || true ;;
       5) menu_sistema      || true ;;
-      6) show_system_status || true; pause ;;
+      6) menu_seguridad    || true ;;
+      7) show_system_status || true; pause ;;
       0) echo; msg_ok "Hasta luego."; echo; exit 0 ;;
       *) msg_error "Opción inválida."; pause ;;
     esac
