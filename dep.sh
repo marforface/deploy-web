@@ -2364,6 +2364,92 @@ cf_delete_tunnel() {
   fi
 }
 
+cf_uninstall() {
+  cf_require_installed || return 1
+  msg_section "Eliminar cloudflared de la máquina"
+
+  # Detectar hostnames configurados en el config.yml
+  local linked_hosts=()
+  if [[ -f "$CLOUDFLARED_CONFIG" ]]; then
+    mapfile -t linked_hosts < <(awk '/^  - hostname:/ {print $3}' "$CLOUDFLARED_CONFIG")
+  fi
+
+  echo -e "  ${BOLD}${RED}╔══════════════════════════════════════════════════╗${RESET}"
+  echo -e "  ${BOLD}${RED}║   ⚠  DESINSTALAR CLOUDFLARED DE LA MÁQUINA  ⚠    ║${RESET}"
+  echo -e "  ${BOLD}${RED}╚══════════════════════════════════════════════════╝${RESET}"
+  echo
+  msg_warn "Esta acción eliminará de este servidor:"
+  echo -e "    ${RED}•${RESET} El binario/paquete cloudflared"
+  echo -e "    ${RED}•${RESET} El servicio systemd (/etc/systemd/system/cloudflared.service)"
+  echo -e "    ${RED}•${RESET} La configuración local (opcional: /etc/cloudflared y credenciales)"
+  echo
+
+  # Alerta si hay sitios en el config.yml
+  if [[ "${#linked_hosts[@]}" -gt 0 ]]; then
+    msg_error "Hay ${#linked_hosts[@]} sitio(s) publicado(s) por este tunnel en config.yml:"
+    for h in "${linked_hosts[@]}"; do echo "      - $h"; done
+    echo
+    msg_warn "Al desinstalar cloudflared, estos sitios DEJARÁN de ser accesibles vía Cloudflare."
+    echo
+    prompt_yes_no "¿Continuar de todas formas?" "n"
+    [[ "$REPLY_YESNO" != "s" ]] && { msg_ok "Cancelado. No se eliminó nada."; return 0; }
+    echo
+  else
+    msg_ok "No hay sitios configurados en el config.yml."
+    echo
+  fi
+
+  msg_info "Nota: el tunnel y su DNS siguen existiendo en tu cuenta Cloudflare."
+  msg_info "Para borrarlos usa antes: Cloudflare → opción 7 (Eliminar tunnel completo)."
+  echo
+
+  prompt_yes_no "¿Confirmar la desinstalación de cloudflared?" "n"
+  [[ "$REPLY_YESNO" != "s" ]] && { msg_ok "Cancelado."; return 0; }
+
+  # Preguntar si borrar también config y credenciales locales
+  prompt_yes_no "¿Eliminar también /etc/cloudflared y credenciales locales?" "n"
+  local remove_config="$REPLY_YESNO"
+  echo
+
+  msg_info "[1/4] Deteniendo y deshabilitando el servicio..."
+  systemctl stop cloudflared 2>/dev/null || true
+  systemctl disable cloudflared 2>/dev/null || true
+
+  msg_info "[2/4] Eliminando unit file systemd..."
+  rm -f /etc/systemd/system/cloudflared.service 2>/dev/null || true
+  # Unit alternativo que crea 'cloudflared service install'
+  rm -f /etc/systemd/system/multi-user.target.wants/cloudflared.service 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+
+  msg_info "[3/4] Desinstalando el paquete cloudflared..."
+  if dpkg -s cloudflared >/dev/null 2>&1; then
+    apt-get purge -y cloudflared 2>/dev/null \
+      || dpkg -r cloudflared 2>/dev/null || true
+  else
+    # Instalado por binario suelto, no por .deb
+    rm -f /usr/bin/cloudflared /usr/local/bin/cloudflared 2>/dev/null || true
+  fi
+
+  msg_info "[4/4] Limpiando configuración local..."
+  if [[ "$remove_config" == "s" ]]; then
+    rm -rf "$CLOUDFLARED_DIR" 2>/dev/null || true
+    rm -rf /root/.cloudflared 2>/dev/null || true
+    msg_warn "Configuración y credenciales locales eliminadas."
+  else
+    msg_info "Se conservó ${CLOUDFLARED_DIR} y las credenciales locales."
+  fi
+
+  echo
+  if command -v cloudflared >/dev/null 2>&1; then
+    msg_warn "El binario cloudflared aún se detecta en el PATH. Revisa manualmente:"
+    echo "      which cloudflared"
+  else
+    msg_ok "cloudflared desinstalado de la máquina."
+  fi
+  echo
+  msg_info "MariaDB y el Stack Web NO fueron tocados."
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ESTADO GENERAL
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2955,6 +3041,8 @@ menu_cloudflared() {
     echo -e "  ${YELLOW}9)${RESET} Iniciar / Detener / Reiniciar servicio"
     echo -e "  ${YELLOW}10)${RESET} Ver logs"
     echo -e "  ${YELLOW}11)${RESET} Reparar servicio (instalado con --token)"
+    menu_cat "Zona de peligro" "$RED"
+    echo -e "  ${RED}12)${RESET} Eliminar cloudflared de la máquina"
     echo
     echo -e "  ${YELLOW}0)${RESET} ← Volver al menú principal"
     echo
@@ -2971,6 +3059,7 @@ menu_cloudflared() {
       9)  run_item header_cloudflared cf_service_control ;;
       10) run_item header_cloudflared cf_logs ;;
       11) run_item header_cloudflared cf_fix_service ;;
+      12) run_item header_cloudflared cf_uninstall ;;
       0)  return ;;
       *)  msg_error "Opción inválida."; pause ;;
     esac
