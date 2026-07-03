@@ -2807,6 +2807,174 @@ sec_change_ssh_port() {
   fi
 }
 
+sec_ssh_key_access() {
+  msg_section "Acceso por clave SSH desde tu Mac"
+
+  local auth_keys="/root/.ssh/authorized_keys"
+  local ssh_port; ssh_port="$(_detect_ssh_port)"
+  local server_ip; server_ip="$(detect_primary_ip 2>/dev/null || echo '<IP-DEL-VPS>')"
+
+  mkdir -p /root/.ssh
+  chmod 700 /root/.ssh
+  touch "$auth_keys"
+  chmod 600 "$auth_keys"
+
+  local n_keys
+  n_keys="$(grep -cE '^(ssh-|ecdsa-|sk-)' "$auth_keys" 2>/dev/null || echo 0)"
+
+  echo
+  printf "  %-28s %s\n" "Claves autorizadas (root):" "${n_keys}"
+  printf "  %-28s %s\n" "Puerto SSH:"                 "${ssh_port}"
+  printf "  %-28s %s\n" "IP del servidor:"            "${server_ip}"
+  echo
+  echo "  1) Autorizar la clave pública de tu Mac  (pegar aquí)"
+  echo "  2) Ver guía completa de conexión desde el Mac"
+  echo "  3) Listar claves autorizadas"
+  echo "  4) Eliminar una clave autorizada"
+  echo "  0) Cancelar"
+  echo
+
+  local opt
+  read -rp "  Opción: " opt
+  case "$opt" in
+
+    1)
+      echo
+      msg_info "En tu Mac, obtén la clave pública con:"
+      echo
+      echo "      cat ~/.ssh/id_ed25519.pub"
+      echo
+      msg_info "Si no existe, créala primero (en el Mac):"
+      echo
+      echo "      ssh-keygen -t ed25519 -C \"macbook\""
+      echo
+      msg_info "Pega aquí la clave pública completa (una sola línea):"
+      echo
+      local pubkey=""
+      read -rp "  > " pubkey
+      [[ -z "$pubkey" ]] && { msg_error "No se ingresó ninguna clave."; return 1; }
+
+      if ! [[ "$pubkey" =~ ^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com)[[:space:]] ]]; then
+        msg_error "Formato inválido. Debe comenzar con ssh-ed25519, ssh-rsa o ecdsa-sha2-*."
+        return 1
+      fi
+
+      if grep -qF "$(awk '{print $2}' <<< "$pubkey")" "$auth_keys" 2>/dev/null; then
+        msg_warn "Esa clave ya está autorizada."; return 0
+      fi
+
+      echo "$pubkey" >> "$auth_keys"
+      chmod 600 "$auth_keys"
+      msg_ok "Clave autorizada en ${auth_keys}"
+      echo
+      msg_info "Prueba desde tu Mac (sin cerrar esta sesión):"
+      echo
+      echo "      ssh -p ${ssh_port} root@${server_ip}"
+      echo
+      msg_info "Si conecta sin pedir contraseña, ya puedes deshabilitar el acceso"
+      msg_info "por contraseña en: Seguridad → Habilitar/Deshabilitar acceso SSH por contraseña."
+      ;;
+
+    2)
+      echo
+      msg_section "Guía: conexión por clave SSH desde tu Mac"
+      echo -e "  ${BOLD}Paso 1 — Generar la clave en el Mac (si no existe):${RESET}"
+      echo
+      echo "      ssh-keygen -t ed25519 -C \"macbook\""
+      echo "      (Enter en todas las preguntas para usar los valores por defecto)"
+      echo
+      echo -e "  ${BOLD}Paso 2 — Copiar la clave al VPS (elige UNA opción):${RESET}"
+      echo
+      echo "      # Opción A — automática (pide la contraseña una última vez):"
+      echo "      ssh-copy-id -i ~/.ssh/id_ed25519.pub -p ${ssh_port} root@${server_ip}"
+      echo
+      echo "      # Opción B — manual: copia la salida de"
+      echo "      cat ~/.ssh/id_ed25519.pub"
+      echo "      # y pégala en este menú → opción 1"
+      echo
+      echo -e "  ${BOLD}Paso 3 — Crear alias en el Mac (archivo ~/.ssh/config):${RESET}"
+      echo
+      echo "      Host vps"
+      echo "          HostName ${server_ip}"
+      echo "          User root"
+      echo "          Port ${ssh_port}"
+      echo "          IdentityFile ~/.ssh/id_ed25519"
+      echo
+      echo -e "  ${BOLD}Paso 4 — Conectar:${RESET}"
+      echo
+      echo "      ssh vps"
+      echo
+      msg_info "Con el alias, también funcionan directo: scp archivo vps:/ruta/  y  rsync."
+      echo
+      msg_warn "Verificado el acceso por clave, deshabilita las contraseñas:"
+      msg_warn "Seguridad → Habilitar/Deshabilitar acceso SSH por contraseña → opción 2."
+      ;;
+
+    3)
+      echo
+      if [[ "$n_keys" -eq 0 ]]; then
+        msg_warn "No hay claves autorizadas."
+      else
+        msg_info "Claves en ${auth_keys}:"
+        echo
+        local i=1
+        while IFS= read -r line; do
+          [[ "$line" =~ ^(ssh-|ecdsa-|sk-) ]] || continue
+          local ktype kcomment kfp
+          ktype="$(awk '{print $1}' <<< "$line")"
+          kcomment="$(awk '{print $3}' <<< "$line")"
+          kfp="$(ssh-keygen -lf /dev/stdin <<< "$line" 2>/dev/null | awk '{print $2}')"
+          printf "  %d) %-14s %-24s %s\n" "$i" "$ktype" "${kcomment:-—}" "${kfp:-}"
+          ((i++))
+        done < "$auth_keys"
+      fi
+      ;;
+
+    4)
+      echo
+      local keys=() labels=()
+      while IFS= read -r line; do
+        [[ "$line" =~ ^(ssh-|ecdsa-|sk-) ]] || continue
+        keys+=("$line")
+        labels+=("$(awk '{print $1" "$3}' <<< "$line")")
+      done < "$auth_keys"
+
+      if [[ "${#keys[@]}" -eq 0 ]]; then
+        msg_warn "No hay claves autorizadas."; return 0
+      fi
+
+      echo "  Selecciona la clave a eliminar:"; echo
+      local i=1
+      for l in "${labels[@]}"; do
+        printf "  %d) %s\n" "$i" "$l"; ((i++))
+      done
+      echo "  0) Cancelar"; echo
+
+      local kopt
+      read -rp "  Opción: " kopt
+      [[ "$kopt" == "0" ]] && return 0
+      if ! [[ "$kopt" =~ ^[0-9]+$ ]] || (( kopt < 1 || kopt > ${#keys[@]} )); then
+        msg_error "Opción inválida."; return 1
+      fi
+
+      if [[ "${#keys[@]}" -eq 1 ]]; then
+        msg_warn "Es la ÚNICA clave autorizada. Si el acceso por contraseña está"
+        msg_warn "deshabilitado, quedarás fuera del servidor."
+        prompt_yes_no "¿Eliminar de todas formas?" "n"
+        [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado."; return 0; }
+      fi
+
+      local target="${keys[$((kopt-1))]}"
+      grep -vF "$target" "$auth_keys" > "${auth_keys}.tmp" && mv "${auth_keys}.tmp" "$auth_keys"
+      chmod 600 "$auth_keys"
+      msg_ok "Clave eliminada: ${labels[$((kopt-1))]}"
+      ;;
+
+    0) return 0 ;;
+    *) msg_error "Opción inválida." ;;
+  esac
+}
+
 sec_nginx_headers() {
   ensure_web_stack_installed || return 1
   msg_section "Headers de seguridad Nginx"
@@ -2899,12 +3067,12 @@ sec_audit() {
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     _chk "UFW firewall" ok "activo"
   else
-    _chk "UFW firewall" warn "inactivo o no instalado (Seguridad → 5)"
+    _chk "UFW firewall" warn "inactivo o no instalado (Seguridad → 6)"
   fi
   if dpkg -s fail2ban >/dev/null 2>&1 && systemctl is-active --quiet fail2ban; then
     _chk "fail2ban" ok "activo"
   else
-    _chk "fail2ban" warn "inactivo o no instalado (Seguridad → 6)"
+    _chk "fail2ban" warn "inactivo o no instalado (Seguridad → 7)"
   fi
 
   echo; echo -e "  ${BOLD}── SSH ──${RESET}"
@@ -2923,7 +3091,7 @@ sec_audit() {
   echo; echo -e "  ${BOLD}── Nginx ──${RESET}"
   [[ -f "$NGINX_SEC_SNIPPET" ]] \
     && _chk "Headers de seguridad" ok "snippet instalado" \
-    || _chk "Headers de seguridad" warn "sin configurar (Seguridad → 7)"
+    || _chk "Headers de seguridad" warn "sin configurar (Seguridad → 8)"
   grep -rq "server_tokens off" /etc/nginx/ 2>/dev/null \
     && _chk "server_tokens" ok "off (versión oculta)" \
     || _chk "server_tokens" warn "versión de Nginx expuesta"
@@ -2972,7 +3140,7 @@ sec_audit() {
   echo; echo -e "  ${BOLD}── Sistema ──${RESET}"
   dpkg -s unattended-upgrades >/dev/null 2>&1 \
     && _chk "Actualizaciones automáticas" ok "habilitadas" \
-    || _chk "Actualizaciones automáticas" warn "sin configurar (Seguridad → 8)"
+    || _chk "Actualizaciones automáticas" warn "sin configurar (Seguridad → 9)"
   local pending
   pending="$(apt list --upgradable 2>/dev/null | grep -c "security" || true)"
   [[ "${pending:-0}" -eq 0 ]] \
@@ -3026,32 +3194,34 @@ menu_seguridad() {
     echo -e "  ${RED}1)${RESET} ${BOLD}Blindaje completo${RESET}  (firewall + fail2ban + SSH + Nginx + updates + auditoría)"
     menu_cat "Acceso SSH (prioridad alta)" "$RED"
     echo -e "  ${RED}2)${RESET} Endurecer SSH  (root sin password, límites de intentos)"
-    echo -e "  ${RED}3)${RESET} Habilitar / Deshabilitar acceso SSH por contraseña"
-    echo -e "  ${RED}4)${RESET} Cambiar puerto SSH"
+    echo -e "  ${RED}3)${RESET} Acceso por clave SSH desde tu Mac  (autorizar clave + guía)"
+    echo -e "  ${RED}4)${RESET} Habilitar / Deshabilitar acceso SSH por contraseña"
+    echo -e "  ${RED}5)${RESET} Cambiar puerto SSH"
     menu_cat "Red y fuerza bruta" "$RED"
-    echo -e "  ${RED}5)${RESET} Firewall UFW  (deny incoming + SSH/HTTP/HTTPS)"
-    echo -e "  ${RED}6)${RESET} fail2ban  (anti fuerza bruta: SSH + Nginx)"
+    echo -e "  ${RED}6)${RESET} Firewall UFW  (deny incoming + SSH/HTTP/HTTPS)"
+    echo -e "  ${RED}7)${RESET} fail2ban  (anti fuerza bruta: SSH + Nginx)"
     menu_cat "Web y sistema" "$RED"
-    echo -e "  ${RED}7)${RESET} Headers de seguridad Nginx  (+ ocultar versión)"
-    echo -e "  ${RED}8)${RESET} Actualizaciones de seguridad automáticas"
+    echo -e "  ${RED}8)${RESET} Headers de seguridad Nginx  (+ ocultar versión)"
+    echo -e "  ${RED}9)${RESET} Actualizaciones de seguridad automáticas"
     menu_cat "Verificación" "$RED"
-    echo -e "  ${RED}9)${RESET} Auditoría de seguridad  (chequeo completo del entorno)"
+    echo -e "  ${RED}10)${RESET} Auditoría de seguridad  (chequeo completo del entorno)"
     echo
     echo -e "  ${RED}0)${RESET} ← Volver al menú principal"
     echo
     read -rp "  Opción: " opt
     case "$opt" in
-      1) run_item header_seguridad sec_harden_all ;;
-      2) run_item header_seguridad sec_harden_ssh ;;
-      3) run_item header_seguridad sec_ssh_password_toggle ;;
-      4) run_item header_seguridad sec_change_ssh_port ;;
-      5) run_item header_seguridad sec_install_ufw ;;
-      6) run_item header_seguridad sec_install_fail2ban ;;
-      7) run_item header_seguridad sec_nginx_headers ;;
-      8) run_item header_seguridad sec_auto_updates ;;
-      9) run_item header_seguridad sec_audit ;;
-      0) return ;;
-      *) msg_error "Opción inválida."; pause ;;
+      1)  run_item header_seguridad sec_harden_all ;;
+      2)  run_item header_seguridad sec_harden_ssh ;;
+      3)  run_item header_seguridad sec_ssh_key_access ;;
+      4)  run_item header_seguridad sec_ssh_password_toggle ;;
+      5)  run_item header_seguridad sec_change_ssh_port ;;
+      6)  run_item header_seguridad sec_install_ufw ;;
+      7)  run_item header_seguridad sec_install_fail2ban ;;
+      8)  run_item header_seguridad sec_nginx_headers ;;
+      9)  run_item header_seguridad sec_auto_updates ;;
+      10) run_item header_seguridad sec_audit ;;
+      0)  return ;;
+      *)  msg_error "Opción inválida."; pause ;;
     esac
   done
 }
