@@ -342,6 +342,30 @@ https://packages.sury.org/php/ ${DEBIAN_CODENAME} main" \
 
   echo
   msg_ok "Stack base listo: Nginx + PHP ${PHP_VERSION}-FPM en ${DEBIAN_CODENAME}."
+
+  # Ofrecer cloudflared para dejar el entorno listo para publicar sitios
+  if ! cf_installed; then
+    echo
+    msg_info "Para publicar sitios vía Cloudflare Tunnel se recomienda instalar cloudflared ahora."
+    prompt_yes_no "¿Instalar cloudflared?" "s"
+    if [[ "$REPLY_YESNO" == "s" ]]; then
+      echo
+      cf_install || { msg_warn "cloudflared no se pudo instalar. Hazlo desde el menú Cloudflare."; return 0; }
+      echo
+      prompt_yes_no "¿Autenticar con Cloudflare ahora? (abre URL para autorizar el dominio)" "s"
+      if [[ "$REPLY_YESNO" == "s" ]]; then
+        echo
+        cf_login || msg_warn "Autenticación pendiente. Complétala en: Cloudflare → opción 2."
+        echo
+        msg_info "Siguiente paso sugerido: Cloudflare → opción 3 (Crear tunnel + config.yml)"
+      else
+        msg_info "Cuando quieras: Cloudflare → opción 2 (Autenticar) → opción 3 (Crear tunnel)."
+      fi
+    fi
+  else
+    echo
+    msg_ok "cloudflared ya está instalado en esta máquina."
+  fi
 }
 
 ensure_web_stack_installed() {
@@ -2639,6 +2663,150 @@ sec_harden_ssh() {
   msg_warn "NO cierres esta sesión: abre OTRA terminal y verifica que puedes conectar."
 }
 
+sec_ssh_password_toggle() {
+  msg_section "Acceso SSH por contraseña"
+
+  local sshd=/etc/ssh/sshd_config
+  [[ ! -f "$sshd" ]] && { msg_warn "OpenSSH server no está instalado."; return 0; }
+
+  local current
+  current="$(awk '/^[[:space:]]*PasswordAuthentication[[:space:]]/ {print $2; exit}' "$sshd")"
+  current="${current:-yes (default)}"
+
+  echo
+  printf "  %-32s ${BOLD}%s${RESET}\n" "PasswordAuthentication actual:" "$current"
+  echo
+  echo "  1) Habilitar acceso por contraseña"
+  echo "  2) Deshabilitar acceso por contraseña  (solo claves SSH)"
+  echo "  0) Cancelar"
+  echo
+
+  local opt new_val=""
+  read -rp "  Opción: " opt
+  case "$opt" in
+    1) new_val="yes" ;;
+    2) new_val="no"  ;;
+    0) return 0 ;;
+    *) msg_error "Opción inválida."; return 1 ;;
+  esac
+
+  if [[ "$new_val" == "no" ]]; then
+    msg_warn "Con contraseñas deshabilitadas SOLO podrás entrar con clave SSH."
+    prompt_yes_no "¿Confirmas que tienes una clave SSH funcionando o consola alternativa?" "n"
+    [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado. Configura una clave SSH primero."; return 0; }
+  else
+    msg_warn "Habilitar contraseñas reduce la seguridad. Úsalo solo si es necesario."
+    prompt_yes_no "¿Continuar?" "s"
+    [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado."; return 0; }
+  fi
+
+  cp "$sshd" "${sshd}.bak.$(date +%F-%H%M%S)"
+  if grep -qE "^[#[:space:]]*PasswordAuthentication[[:space:]]" "$sshd"; then
+    sed -i "s|^[#[:space:]]*PasswordAuthentication[[:space:]].*|PasswordAuthentication ${new_val}|" "$sshd"
+  else
+    echo "PasswordAuthentication ${new_val}" >> "$sshd"
+  fi
+
+  if sshd -t 2>/dev/null; then
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
+    msg_ok "PasswordAuthentication → ${new_val}. Servicio SSH reiniciado."
+    [[ "$new_val" == "no" ]] \
+      && msg_warn "Verifica el acceso con clave desde OTRA terminal antes de cerrar esta sesión."
+  else
+    msg_error "sshd_config inválido. Restaurando backup..."
+    cp "$(ls -t "${sshd}.bak."* | head -1)" "$sshd" 2>/dev/null || true
+    return 1
+  fi
+}
+
+sec_change_ssh_port() {
+  msg_section "Cambiar puerto SSH"
+
+  local sshd=/etc/ssh/sshd_config
+  [[ ! -f "$sshd" ]] && { msg_warn "OpenSSH server no está instalado."; return 0; }
+
+  local old_port; old_port="$(_detect_ssh_port)"
+  echo
+  printf "  %-24s ${BOLD}%s${RESET}\n" "Puerto SSH actual:" "$old_port"
+  echo
+  msg_info "Un puerto no estándar reduce el ruido de bots (no sustituye a fail2ban/UFW)."
+  msg_info "Sugerencia: usa un puerto entre 1024 y 65535 no ocupado (ej: 2222, 22022)."
+  echo
+
+  local new_port=""
+  while true; do
+    read -rp "  Nuevo puerto SSH (0 = cancelar): " new_port
+    [[ "$new_port" == "0" ]] && return 0
+    if ! valid_port "$new_port"; then
+      msg_error "Puerto inválido (1-65535)."; continue
+    fi
+    if [[ "$new_port" == "$old_port" ]]; then
+      msg_warn "Es el mismo puerto actual."; continue
+    fi
+    if ss -tln 2>/dev/null | awk '{print $4}' | grep -qE ":${new_port}$"; then
+      msg_error "El puerto ${new_port} ya está en uso por otro servicio."; continue
+    fi
+    break
+  done
+
+  echo
+  msg_warn "Pasos que se aplicarán:"
+  echo "      1. Permitir ${new_port}/tcp en UFW (si está activo) ANTES del cambio"
+  echo "      2. Cambiar Port en sshd_config y reiniciar SSH"
+  echo "      3. Actualizar el puerto en fail2ban (si está instalado)"
+  echo "      4. La regla UFW del puerto antiguo (${old_port}) se elimina SOLO cuando confirmes"
+  echo "         que ya probaste la conexión nueva."
+  echo
+  prompt_yes_no "¿Aplicar el cambio de puerto ${old_port} → ${new_port}?" "n"
+  [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado."; return 0; }
+
+  # 1) Abrir el puerto nuevo en UFW antes de tocar SSH (anti-lockout)
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow "${new_port}/tcp" comment 'SSH' >/dev/null
+    msg_ok "UFW: ${new_port}/tcp permitido."
+  fi
+
+  # 2) sshd_config
+  cp "$sshd" "${sshd}.bak.$(date +%F-%H%M%S)"
+  if grep -qE "^[#[:space:]]*Port[[:space:]]" "$sshd"; then
+    sed -i "0,/^[#[:space:]]*Port[[:space:]].*/s//Port ${new_port}/" "$sshd"
+  else
+    echo "Port ${new_port}" >> "$sshd"
+  fi
+
+  if ! sshd -t 2>/dev/null; then
+    msg_error "sshd_config inválido. Restaurando backup..."
+    cp "$(ls -t "${sshd}.bak."* | head -1)" "$sshd" 2>/dev/null || true
+    return 1
+  fi
+  systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
+  msg_ok "SSH escuchando en el puerto ${new_port}."
+
+  # 3) fail2ban
+  if [[ -f /etc/fail2ban/jail.local ]]; then
+    sed -i "s/^port    = .*/port    = ${new_port}/" /etc/fail2ban/jail.local
+    systemctl restart fail2ban 2>/dev/null || true
+    msg_ok "fail2ban actualizado al puerto ${new_port}."
+  fi
+
+  echo
+  msg_warn "PRUEBA AHORA desde OTRA terminal (sin cerrar esta):"
+  echo "      ssh -p ${new_port} root@$(detect_primary_ip 2>/dev/null || echo '<IP>')"
+  echo
+
+  # 4) Cierre del puerto antiguo solo tras confirmación
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    prompt_yes_no "¿La conexión por el puerto ${new_port} funciona? (eliminar regla del ${old_port})" "n"
+    if [[ "$REPLY_YESNO" == "s" ]]; then
+      ufw delete allow "${old_port}/tcp" >/dev/null 2>&1 || true
+      msg_ok "UFW: regla del puerto ${old_port} eliminada."
+    else
+      msg_warn "Se mantuvo abierta la regla del puerto ${old_port} en UFW por seguridad."
+      msg_info "Elimínala luego con: ufw delete allow ${old_port}/tcp"
+    fi
+  fi
+}
+
 sec_nginx_headers() {
   ensure_web_stack_installed || return 1
   msg_section "Headers de seguridad Nginx"
@@ -2731,12 +2899,12 @@ sec_audit() {
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     _chk "UFW firewall" ok "activo"
   else
-    _chk "UFW firewall" warn "inactivo o no instalado (Seguridad → 1)"
+    _chk "UFW firewall" warn "inactivo o no instalado (Seguridad → 5)"
   fi
   if dpkg -s fail2ban >/dev/null 2>&1 && systemctl is-active --quiet fail2ban; then
     _chk "fail2ban" ok "activo"
   else
-    _chk "fail2ban" warn "inactivo o no instalado (Seguridad → 2)"
+    _chk "fail2ban" warn "inactivo o no instalado (Seguridad → 6)"
   fi
 
   echo; echo -e "  ${BOLD}── SSH ──${RESET}"
@@ -2745,7 +2913,7 @@ sec_audit() {
   pauth="$(awk '/^PasswordAuthentication/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)"
   case "$prl" in
     no|prohibit-password) _chk "PermitRootLogin" ok "$prl" ;;
-    yes)                  _chk "PermitRootLogin" warn "yes — root con contraseña (Seguridad → 3)" ;;
+    yes)                  _chk "PermitRootLogin" warn "yes — root con contraseña (Seguridad → 2)" ;;
     *)                    _chk "PermitRootLogin" warn "${prl:-default} — revisar" ;;
   esac
   [[ "$pauth" == "no" ]] \
@@ -2755,7 +2923,7 @@ sec_audit() {
   echo; echo -e "  ${BOLD}── Nginx ──${RESET}"
   [[ -f "$NGINX_SEC_SNIPPET" ]] \
     && _chk "Headers de seguridad" ok "snippet instalado" \
-    || _chk "Headers de seguridad" warn "sin configurar (Seguridad → 4)"
+    || _chk "Headers de seguridad" warn "sin configurar (Seguridad → 7)"
   grep -rq "server_tokens off" /etc/nginx/ 2>/dev/null \
     && _chk "server_tokens" ok "off (versión oculta)" \
     || _chk "server_tokens" warn "versión de Nginx expuesta"
@@ -2804,7 +2972,7 @@ sec_audit() {
   echo; echo -e "  ${BOLD}── Sistema ──${RESET}"
   dpkg -s unattended-upgrades >/dev/null 2>&1 \
     && _chk "Actualizaciones automáticas" ok "habilitadas" \
-    || _chk "Actualizaciones automáticas" warn "sin configurar (Seguridad → 5)"
+    || _chk "Actualizaciones automáticas" warn "sin configurar (Seguridad → 8)"
   local pending
   pending="$(apt list --upgradable 2>/dev/null | grep -c "security" || true)"
   [[ "${pending:-0}" -eq 0 ]] \
@@ -2854,27 +3022,34 @@ menu_seguridad() {
   while true; do
     clear
     header_seguridad; echo
-    menu_cat "Protección" "$RED"
-    echo -e "  ${RED}1)${RESET} Firewall UFW  (deny incoming + SSH/HTTP/HTTPS)"
-    echo -e "  ${RED}2)${RESET} fail2ban  (anti fuerza bruta: SSH + Nginx)"
-    echo -e "  ${RED}3)${RESET} Endurecer SSH  (root sin password, límites de intentos)"
-    echo -e "  ${RED}4)${RESET} Headers de seguridad Nginx  (+ ocultar versión)"
-    echo -e "  ${RED}5)${RESET} Actualizaciones de seguridad automáticas"
+    menu_cat "Acción rápida" "$RED"
+    echo -e "  ${RED}1)${RESET} ${BOLD}Blindaje completo${RESET}  (firewall + fail2ban + SSH + Nginx + updates + auditoría)"
+    menu_cat "Acceso SSH (prioridad alta)" "$RED"
+    echo -e "  ${RED}2)${RESET} Endurecer SSH  (root sin password, límites de intentos)"
+    echo -e "  ${RED}3)${RESET} Habilitar / Deshabilitar acceso SSH por contraseña"
+    echo -e "  ${RED}4)${RESET} Cambiar puerto SSH"
+    menu_cat "Red y fuerza bruta" "$RED"
+    echo -e "  ${RED}5)${RESET} Firewall UFW  (deny incoming + SSH/HTTP/HTTPS)"
+    echo -e "  ${RED}6)${RESET} fail2ban  (anti fuerza bruta: SSH + Nginx)"
+    menu_cat "Web y sistema" "$RED"
+    echo -e "  ${RED}7)${RESET} Headers de seguridad Nginx  (+ ocultar versión)"
+    echo -e "  ${RED}8)${RESET} Actualizaciones de seguridad automáticas"
     menu_cat "Verificación" "$RED"
-    echo -e "  ${RED}6)${RESET} Auditoría de seguridad  (chequeo completo del entorno)"
-    echo -e "  ${RED}7)${RESET} ${BOLD}Blindaje completo${RESET}  (aplica 1→5 y audita)"
+    echo -e "  ${RED}9)${RESET} Auditoría de seguridad  (chequeo completo del entorno)"
     echo
     echo -e "  ${RED}0)${RESET} ← Volver al menú principal"
     echo
     read -rp "  Opción: " opt
     case "$opt" in
-      1) run_item header_seguridad sec_install_ufw ;;
-      2) run_item header_seguridad sec_install_fail2ban ;;
-      3) run_item header_seguridad sec_harden_ssh ;;
-      4) run_item header_seguridad sec_nginx_headers ;;
-      5) run_item header_seguridad sec_auto_updates ;;
-      6) run_item header_seguridad sec_audit ;;
-      7) run_item header_seguridad sec_harden_all ;;
+      1) run_item header_seguridad sec_harden_all ;;
+      2) run_item header_seguridad sec_harden_ssh ;;
+      3) run_item header_seguridad sec_ssh_password_toggle ;;
+      4) run_item header_seguridad sec_change_ssh_port ;;
+      5) run_item header_seguridad sec_install_ufw ;;
+      6) run_item header_seguridad sec_install_fail2ban ;;
+      7) run_item header_seguridad sec_nginx_headers ;;
+      8) run_item header_seguridad sec_auto_updates ;;
+      9) run_item header_seguridad sec_audit ;;
       0) return ;;
       *) msg_error "Opción inválida."; pause ;;
     esac
