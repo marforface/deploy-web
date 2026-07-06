@@ -5,7 +5,7 @@
 # ==============================================================================
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.7 - Marcos Espinoza Torres"
+readonly SCRIPT_VERSION="1.8 - Marcos Espinoza Torres"
 readonly CATCH_ALL_FILE="/etc/nginx/sites-available/000-catch-all"
 readonly MARIADB_CNF="/etc/mysql/mariadb.conf.d/50-server.cnf"
 readonly SESSION_OPTIONS=(2 4 8 16 24)
@@ -3227,6 +3227,490 @@ menu_seguridad() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
+# MONITOR — DASHBOARD EN VIVO (estilo htop)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_hbytes() {
+  local b=${1:-0}
+  if   (( b >= 1073741824 )); then printf "%d.%d GB" $(( b / 1073741824 )) $(( (b % 1073741824) * 10 / 1073741824 ))
+  elif (( b >= 1048576 ));    then printf "%d.%d MB" $(( b / 1048576 ))    $(( (b % 1048576) * 10 / 1048576 ))
+  elif (( b >= 1024 ));       then printf "%d KB" $(( b / 1024 ))
+  else                             printf "%d B" "$b"
+  fi
+}
+
+_bar() {
+  local pct=${1:-0} width=${2:-22}
+  (( pct < 0 )) && pct=0
+  (( pct > 100 )) && pct=100
+  local filled=$(( pct * width / 100 )) color="$GREEN" i out=""
+  (( pct >= 60 )) && color="$YELLOW"
+  (( pct >= 85 )) && color="$RED"
+  for (( i=0; i<filled; i++ )); do out+="█"; done
+  for (( i=filled; i<width; i++ )); do out+="░"; done
+  printf '%b%s%b' "$color" "$out" "$RESET"
+}
+
+_dot() {
+  systemctl is-active --quiet "$1" 2>/dev/null \
+    && printf '%b●%b' "$GREEN" "$RESET" \
+    || printf '%b●%b' "$RED" "$RESET"
+}
+
+_MON_PIDLE=0; _MON_PTOTAL=0
+_mon_cpu() {  # → MON_CPU (porcentaje)
+  local -a f
+  read -r -a f < /proc/stat
+  local idle=$(( f[4] + f[5] )) total=0 v
+  for v in "${f[@]:1:8}"; do total=$(( total + v )); done
+  local di=$(( idle - _MON_PIDLE )) dt=$(( total - _MON_PTOTAL ))
+  _MON_PIDLE=$idle; _MON_PTOTAL=$total
+  if (( dt > 0 )); then MON_CPU=$(( (dt - di) * 100 / dt )); else MON_CPU=0; fi
+}
+
+_MON_PRX=0; _MON_PTX=0; _MON_PT=0
+_mon_net() {  # → MON_RXS MON_TXS (B/s) MON_RXT MON_TXT (totales) MON_IFACE
+  local iface rx tx now
+  iface="$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'dev \K\S+' | head -1)"
+  MON_IFACE="${iface:-?}"
+  read -r rx tx < <(awk -v i="$iface" '$0 ~ i":" {sub(/^[^:]*:/,""); print $1, $9; exit}' /proc/net/dev)
+  rx=${rx:-0}; tx=${tx:-0}
+  now=$(date +%s)
+  local dt=$(( now - _MON_PT ))
+  (( dt <= 0 )) && dt=1
+  if (( _MON_PRX > 0 )); then
+    MON_RXS=$(( (rx - _MON_PRX) / dt ))
+    MON_TXS=$(( (tx - _MON_PTX) / dt ))
+  else
+    MON_RXS=0; MON_TXS=0
+  fi
+  (( MON_RXS < 0 )) && MON_RXS=0
+  (( MON_TXS < 0 )) && MON_TXS=0
+  _MON_PRX=$rx; _MON_PTX=$tx; _MON_PT=$now
+  MON_RXT=$rx; MON_TXT=$tx
+}
+
+_mon_site_row() {  # site → "req 2xx 4xx 5xx ultimo"
+  local site="$1"
+  local log="/var/log/nginx/${site}.access.log"
+  [[ -s "$log" ]] || { echo "0 0 0 0 —"; return; }
+  local sample
+  sample="$(tail -n 4000 "$log" 2>/dev/null | grep -E "\[(${MON_PAT})" || true)"
+  local last
+  if [[ -z "$sample" ]]; then
+    last="$(tail -n 1 "$log" | grep -oE ':[0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1 | cut -c2- || true)"
+    echo "0 0 0 0 ${last:-—}"
+    return
+  fi
+  local counts
+  counts="$(awk '{ n++; c=substr($9,1,1); if(c=="2")a++; else if(c=="4")b++; else if(c=="5")e++ }
+            END{ printf "%d %d %d %d", n+0, a+0, b+0, e+0 }' <<< "$sample")"
+  last="$(tail -n 1 <<< "$sample" | grep -oE ':[0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1 | cut -c2- || true)"
+  echo "${counts} ${last:-—}"
+}
+
+_mon_render() {
+  local now host up load
+  now="$(date '+%H:%M:%S')"
+  host="$(hostname)"
+  up="$(uptime -p 2>/dev/null | sed 's/^up //')"
+  load="$(cut -d' ' -f1-3 /proc/loadavg)"
+
+  local mt mu mp st su sp=0
+  read -r mt mu < <(free -b | awk '/^Mem/  {print $2, $3}')
+  read -r st su < <(free -b | awk '/^Swap/ {print $2, $3}')
+  mp=$(( mu * 100 / mt ))
+  (( st > 0 )) && sp=$(( su * 100 / st ))
+
+  local dp dus dts
+  read -r dp dus dts < <(df -h / | awk 'NR==2 {gsub("%","",$5); print $5, $3, $2}')
+
+  echo -e "${BOLD}${BLUE}╔═ DevLab Monitor ══ ${WHITE}${host}${BLUE} ══ ${WHITE}${now}${BLUE} ══ refresco ${MON_INTERVAL}s ═╗${RESET}"
+  echo
+  printf "  ${BOLD}CPU${RESET}    %s %3d%%    ${DIM}Load${RESET} %s    ${DIM}Uptime${RESET} %s\n" \
+    "$(_bar "$MON_CPU")" "$MON_CPU" "$load" "$up"
+  printf "  ${BOLD}RAM${RESET}    %s %3d%%    %s / %s    ${DIM}Swap${RESET} %d%%\n" \
+    "$(_bar "$mp")" "$mp" "$(_hbytes "$mu")" "$(_hbytes "$mt")" "$sp"
+  printf "  ${BOLD}Disco${RESET}  %s %3d%%    %s / %s\n" \
+    "$(_bar "$dp")" "$dp" "$dus" "$dts"
+  printf "  ${BOLD}Red${RESET}    ↓ %s/s   ↑ %s/s   ${DIM}(%s)${RESET}   Σ↓ %s   Σ↑ %s\n" \
+    "$(_hbytes "$MON_RXS")" "$(_hbytes "$MON_TXS")" "$MON_IFACE" \
+    "$(_hbytes "$MON_RXT")" "$(_hbytes "$MON_TXT")"
+  echo
+
+  local php_dot="${YELLOW}●${RESET}" ufw_dot="${RED}●${RESET}"
+  [[ -n "$PHP_VERSION" ]] && php_dot="$(_dot "php${PHP_VERSION}-fpm")"
+  ufw status 2>/dev/null | grep -q "Status: active" && ufw_dot="${GREEN}●${RESET}"
+  local nconn nphp ndb="—"
+  nconn="$(ss -Htn state established 2>/dev/null | wc -l | tr -d ' ')"
+  nphp="$(pgrep -c php-fpm 2>/dev/null || echo 0)"
+  if mariadb_installed && mariadb_running; then
+    ndb="$(mariadb -sNe 'SELECT COUNT(*) FROM information_schema.processlist' 2>/dev/null || echo '?')"
+  fi
+  echo -e "  ${BOLD}Servicios${RESET}   Nginx $(_dot nginx)   PHP-FPM ${php_dot}   MariaDB $(_dot mariadb)   Cloudflared $(_dot cloudflared)   fail2ban $(_dot fail2ban)   UFW ${ufw_dot}"
+  echo -e "  ${DIM}Conexiones TCP: ${nconn}    Procesos PHP: ${nphp}    Conexiones DB: ${ndb}${RESET}"
+  echo
+
+  echo -e "  ${BOLD}Sitios — actividad últimos 5 min${RESET}"
+  printf "  ${DIM}%-24s %-2s %6s %6s %6s %6s   %-9s %9s${RESET}\n" \
+    "SITIO" "ON" "REQ" "2xx" "4xx" "5xx" "ÚLTIMO" "DISCO"
+  if [[ ${#MON_SITES[@]} -eq 0 ]]; then
+    echo -e "  ${DIM}No hay sitios configurados.${RESET}"
+  else
+    local s on req s2 s4 s5 lastt rcolor
+    for s in "${MON_SITES[@]}"; do
+      [[ -L "/etc/nginx/sites-enabled/${s}" ]] \
+        && on="${GREEN}●${RESET}" || on="${RED}●${RESET}"
+      read -r req s2 s4 s5 lastt <<< "$(_mon_site_row "$s")"
+      rcolor="$RESET"
+      (( s5 > 0 )) && rcolor="$RED"
+      (( s5 == 0 && s4 > 0 )) && rcolor="$YELLOW"
+      printf "  %-24s %b %b%6s%b %6s %6s %6s   %-9s %9s\n" \
+        "$s" "$on" "$rcolor" "$req" "$RESET" "$s2" "$s4" "$s5" "$lastt" "${MON_DU[$s]:-—}"
+    done
+  fi
+  echo
+  echo -e "  ${DIM}[q] salir   [r] refrescar ahora   [+/-] intervalo${RESET}"
+}
+
+run_dashboard() {
+  local interval=3 cycles=0 key frame s i p pat
+  mapfile -t MON_SITES < <(
+    find /etc/nginx/sites-available -maxdepth 1 -type f -printf '%f\n' 2>/dev/null \
+      | grep -Ev '^default$|^000-catch-all$' | sort
+  )
+  declare -gA MON_DU=()
+  for s in "${MON_SITES[@]}"; do
+    [[ -d "/var/www/${s}" ]] && MON_DU[$s]="$(du -sh "/var/www/${s}" 2>/dev/null | cut -f1)"
+  done
+  _MON_PIDLE=0; _MON_PTOTAL=0; _MON_PRX=0; _MON_PTX=0; _MON_PT=0
+  _mon_cpu; _mon_net
+  tput civis 2>/dev/null || true
+
+  while true; do
+    pat=""
+    for i in 0 1 2 3 4; do
+      p="$(date -d "-${i} min" '+%d/%b/%Y:%H:%M' 2>/dev/null || true)"
+      [[ -n "$p" ]] && pat+="${pat:+|}${p}"
+    done
+    MON_PAT="$pat"
+    MON_INTERVAL="$interval"
+    _mon_cpu
+    _mon_net
+    frame="$(_mon_render)"
+    printf '\033[H\033[2J%s\n' "$frame"
+
+    key=""
+    read -rsn1 -t "$interval" key || true
+    case "$key" in
+      q|Q) break ;;
+      +|=) (( interval < 10 )) && (( interval++ )) || true ;;
+      -|_) (( interval > 1 ))  && (( interval-- )) || true ;;
+    esac
+    (( cycles++ )) || true
+    if (( cycles % 20 == 0 )); then
+      for s in "${MON_SITES[@]}"; do
+        [[ -d "/var/www/${s}" ]] && MON_DU[$s]="$(du -sh "/var/www/${s}" 2>/dev/null | cut -f1)"
+      done
+    fi
+  done
+
+  tput cnorm 2>/dev/null || true
+  clear
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEV TOOLS — UTILIDADES PARA DESARROLLO WEB
+# ══════════════════════════════════════════════════════════════════════════════
+
+dev_live_logs() {
+  ensure_web_stack_installed || return 1
+  choose_site || return 0
+  local site="$CHOSEN_SITE"
+  local alog="/var/log/nginx/${site}.access.log"
+  local elog="/var/log/nginx/${site}.error.log"
+  msg_section "Logs en vivo — ${site}"
+  msg_info "access + error en tiempo real. Ctrl+C para volver al menú."
+  echo
+  trap ':' INT
+  tail -n 15 -F "$alog" "$elog" 2>/dev/null || true
+  trap on_interrupt INT
+  echo
+}
+
+dev_traffic() {
+  ensure_web_stack_installed || return 1
+  choose_site || return 0
+  local site="$CHOSEN_SITE"
+  local log="/var/log/nginx/${site}.access.log"
+  [[ -s "$log" ]] || { msg_warn "Sin datos en ${log}"; return 0; }
+
+  local sample n_sample
+  sample="$(tail -n 5000 "$log")"
+  n_sample="$(wc -l <<< "$sample" | tr -d ' ')"
+  msg_section "Análisis de tráfico — ${site} (muestra: últimas ${n_sample} solicitudes)"
+
+  local today; today="$(date '+%d/%b/%Y')"
+  echo "  Solicitudes hoy: $(grep -c "\[${today}" "$log" 2>/dev/null || echo 0)"
+  echo
+  echo -e "  ${BOLD}── Códigos de respuesta ──${RESET}"
+  awk '{print $9}' <<< "$sample" | sort | uniq -c | sort -rn | head -8 \
+    | awk '{printf "  %6d  %s\n", $1, $2}'
+  echo
+  echo -e "  ${BOLD}── Top 10 IPs ──${RESET}"
+  awk '{print $1}' <<< "$sample" | sort | uniq -c | sort -rn | head -10 \
+    | awk '{printf "  %6d  %s\n", $1, $2}'
+  echo
+  echo -e "  ${BOLD}── Top 10 URLs ──${RESET}"
+  awk '{print $7}' <<< "$sample" | sort | uniq -c | sort -rn | head -10 \
+    | awk '{printf "  %6d  %.70s\n", $1, $2}'
+  echo
+  echo -e "  ${BOLD}── Top 5 User-Agents ──${RESET}"
+  awk -F'"' '{print $6}' <<< "$sample" | sort | uniq -c | sort -rn | head -5 \
+    | awk '{c=$1; $1=""; printf "  %6d %.80s\n", c, $0}'
+}
+
+dev_php_errors() {
+  ensure_web_stack_installed || return 1
+  msg_section "Errores PHP recientes"
+  local flog="/var/log/php${PHP_VERSION}-fpm.log"
+  if [[ -f "$flog" ]]; then
+    echo -e "  ${BOLD}── ${flog} (últimas 20 líneas) ──${RESET}"
+    tail -n 20 "$flog" | sed 's/^/  /'
+  else
+    msg_warn "No existe ${flog}"
+  fi
+  echo
+  echo -e "  ${BOLD}── Errores PHP en logs de Nginx (últimos 25) ──${RESET}"
+  grep -h "PHP" /var/log/nginx/*error.log 2>/dev/null | tail -n 25 | sed 's/^/  /' \
+    || echo "  (sin errores PHP registrados)"
+}
+
+dev_benchmark() {
+  ensure_web_stack_installed || return 1
+  choose_site || return 0
+  local site="$CHOSEN_SITE"
+  local sn
+  sn="$(awk '/server_name / && !/default_server/ {print $2; exit}' \
+        "/etc/nginx/sites-available/${site}" | tr -d ';')"
+  local path
+  read -rp "  Ruta a probar [/]: " path
+  path="${path:-/}"
+  [[ "$path" != /* ]] && path="/${path}"
+
+  msg_section "Benchmark — ${sn}${path} (5 solicitudes locales)"
+  printf "  ${DIM}%-4s %12s %12s %12s %12s %8s${RESET}\n" \
+    "N" "DNS" "Conexión" "TTFB" "Total" "Código"
+  local i out results=""
+  for i in 1 2 3 4 5; do
+    out="$(curl -o /dev/null -sS \
+      -w '%{time_namelookup} %{time_connect} %{time_starttransfer} %{time_total} %{http_code}' \
+      -H "Host: ${sn}" "http://127.0.0.1${path}" 2>/dev/null || echo "0 0 0 0 ERR")"
+    results+="${out}"$'\n'
+    read -r t1 t2 t3 t4 code <<< "$out"
+    printf "  %-4s %11ss %11ss %11ss %11ss %8s\n" "$i" "$t1" "$t2" "$t3" "$t4" "$code"
+  done
+  echo
+  awk 'NF==5 && $5 != "ERR" { d+=$1; c+=$2; f+=$3; t+=$4; n++ }
+       END { if (n>0) printf "  Promedio:  DNS %.4fs   Conexión %.4fs   TTFB %.4fs   Total %.4fs  (%d muestras)\n", d/n, c/n, f/n, t/n, n }' \
+    <<< "$results"
+  echo
+  msg_info "TTFB alto → revisa consultas SQL o OPcache. Total ≫ TTFB → payload grande."
+}
+
+dev_maintenance() {
+  ensure_web_stack_installed || return 1
+  choose_site || return 0
+  local site="$CHOSEN_SITE"
+  local enabled_link="/etc/nginx/sites-enabled/${site}"
+  local maint_conf="/etc/nginx/sites-available/${site}.maintenance"
+  local sn
+  sn="$(awk '/server_name / && !/default_server/ {print $2; exit}' \
+        "/etc/nginx/sites-available/${site}" | tr -d ';')"
+
+  msg_section "Modo mantenimiento — ${site}"
+
+  if [[ "$(readlink -f "$enabled_link" 2>/dev/null)" == "$maint_conf" ]]; then
+    msg_warn "El sitio está EN MANTENIMIENTO."
+    prompt_yes_no "¿Desactivar el modo mantenimiento?" "s"
+    [[ "$REPLY_YESNO" != "s" ]] && return 0
+    ln -sf "/etc/nginx/sites-available/${site}" "$enabled_link"
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx
+    msg_ok "Mantenimiento DESACTIVADO — ${sn} vuelve a estar en línea."
+    return 0
+  fi
+
+  msg_info "El sitio está en línea."
+  prompt_yes_no "¿Activar modo mantenimiento (responde 503 con página amigable)?" "n"
+  [[ "$REPLY_YESNO" != "s" ]] && return 0
+
+  mkdir -p /var/www/devlab-maintenance
+  if [[ ! -f /var/www/devlab-maintenance/index.html ]]; then
+    cat > /var/www/devlab-maintenance/index.html <<'HTML'
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mantenimiento</title>
+<style>
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         font-family:-apple-system,Segoe UI,Roboto,sans-serif;
+         background:linear-gradient(135deg,#1a1a2e,#16213e); color:#eaeaea; text-align:center; }
+  .card { padding:3rem 2.5rem; max-width:480px; }
+  .icon { font-size:4rem; margin-bottom:1rem; }
+  h1 { font-size:1.6rem; margin:0 0 .8rem; }
+  p  { color:#9aa5b1; line-height:1.6; margin:0; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">🛠️</div>
+    <h1>Sitio en mantenimiento</h1>
+    <p>Estamos realizando mejoras. Volveremos a estar en línea en breve.<br>Gracias por tu paciencia.</p>
+  </div>
+</body>
+</html>
+HTML
+  fi
+
+  cat > "$maint_conf" <<EOF
+server {
+    listen 80;
+    server_name ${sn};
+    root /var/www/devlab-maintenance;
+    location / { return 503; }
+    error_page 503 @maintenance;
+    location @maintenance { rewrite ^ /index.html break; }
+}
+EOF
+
+  ln -sf "$maint_conf" "$enabled_link"
+  if nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx
+    msg_ok "Mantenimiento ACTIVADO — ${sn} responde 503 con página amigable."
+    msg_info "Vuelve a esta opción para desactivarlo."
+  else
+    ln -sf "/etc/nginx/sites-available/${site}" "$enabled_link"
+    systemctl reload nginx 2>/dev/null || true
+    msg_error "nginx -t falló. Se restauró el sitio original."
+    return 1
+  fi
+}
+
+dev_basic_auth() {
+  ensure_web_stack_installed || return 1
+  choose_site || return 0
+  local site="$CHOSEN_SITE"
+  local conf="/etc/nginx/sites-available/${site}"
+  local htfile="/etc/nginx/.htpasswd_${site}"
+
+  msg_section "Protección con contraseña (Basic Auth) — ${site}"
+
+  if grep -q "auth_basic" "$conf"; then
+    msg_warn "El sitio YA está protegido con contraseña."
+    prompt_yes_no "¿Quitar la protección?" "n"
+    [[ "$REPLY_YESNO" != "s" ]] && return 0
+    sed -i '/auth_basic/d' "$conf"
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx
+    msg_ok "Protección eliminada. (${htfile} se conservó por si la reactivas)"
+    return 0
+  fi
+
+  msg_info "Útil para sitios en desarrollo/staging que no deben ser públicos."
+  prompt_yes_no "¿Proteger '${site}' con usuario y contraseña?" "s"
+  [[ "$REPLY_YESNO" != "s" ]] && return 0
+
+  command -v htpasswd >/dev/null 2>&1 || apt-get install -y apache2-utils
+
+  local user
+  read -rp "  Usuario: " user
+  [[ -z "$user" ]] && { msg_error "Usuario obligatorio."; return 1; }
+  htpasswd -c "$htfile" "$user"
+  chmod 640 "$htfile"
+
+  sed -i "/server_name /a\\    auth_basic \"Acceso restringido\";\\n    auth_basic_user_file ${htfile};" "$conf"
+
+  if nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx
+    msg_ok "Sitio protegido. El navegador pedirá usuario/contraseña."
+  else
+    sed -i '/auth_basic/d' "$conf"
+    systemctl reload nginx 2>/dev/null || true
+    msg_error "nginx -t falló. Cambios revertidos."
+    return 1
+  fi
+}
+
+dev_opcache_clear() {
+  ensure_web_stack_installed || return 1
+  msg_section "Limpiar OPcache"
+  msg_info "Recarga PHP-FPM ${PHP_VERSION} (graceful): vacía OPcache sin cortar peticiones."
+  systemctl reload "php${PHP_VERSION}-fpm" \
+    && msg_ok "OPcache limpio. Los cambios en código PHP se aplican de inmediato." \
+    || msg_error "No se pudo recargar php${PHP_VERSION}-fpm."
+}
+
+dev_php_limits() {
+  ensure_web_stack_installed || return 1
+  msg_section "Límites y extensiones PHP ${PHP_VERSION} (FPM)"
+  local ini="/etc/php/${PHP_VERSION}/fpm/php.ini"
+  [[ -f "$ini" ]] || { msg_warn "No existe ${ini}"; return 0; }
+  local k
+  for k in memory_limit upload_max_filesize post_max_size max_execution_time \
+           max_input_vars display_errors error_reporting session.gc_maxlifetime; do
+    printf "  %-28s %s\n" "${k}:" \
+      "$(awk -F'=' -v key="$k" '$0 ~ "^"key"[[:space:]]*=" {gsub(/^[ \t]+/,"",$2); print $2; exit}' "$ini")"
+  done
+  echo
+  echo -e "  ${BOLD}Extensiones cargadas:${RESET}"
+  "php${PHP_VERSION}" -m 2>/dev/null | grep -v '^\[' | grep -v '^$' \
+    | tr '\n' ' ' | fold -s -w 90 | sed 's/^/  /'
+  echo
+}
+
+header_devtools() {
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${CYAN}║${WHITE}  [ 8 ] Dev Tools — Desarrollo Web          ${CYAN}║${RESET}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════╝${RESET}"
+}
+
+menu_devtools() {
+  local opt
+  while true; do
+    clear
+    header_devtools; echo
+    menu_cat "Observabilidad" "$CYAN"
+    echo -e "  ${CYAN}1)${RESET} Logs en vivo de un sitio  (access + error)"
+    echo -e "  ${CYAN}2)${RESET} Análisis de tráfico  (top IPs, URLs, códigos, bots)"
+    echo -e "  ${CYAN}3)${RESET} Errores PHP recientes"
+    echo -e "  ${CYAN}4)${RESET} Benchmark de un sitio  (DNS, conexión, TTFB, total)"
+    menu_cat "Control del sitio" "$CYAN"
+    echo -e "  ${CYAN}5)${RESET} Modo mantenimiento ON/OFF  (página 503 amigable)"
+    echo -e "  ${CYAN}6)${RESET} Proteger sitio con contraseña  (Basic Auth)"
+    menu_cat "PHP" "$CYAN"
+    echo -e "  ${CYAN}7)${RESET} Limpiar OPcache  (aplica cambios de código al instante)"
+    echo -e "  ${CYAN}8)${RESET} Límites y extensiones PHP activos"
+    echo
+    echo -e "  ${CYAN}0)${RESET} ← Volver al menú principal"
+    echo
+    read -rp "  Opción: " opt
+    case "$opt" in
+      1) run_item header_devtools dev_live_logs ;;
+      2) run_item header_devtools dev_traffic ;;
+      3) run_item header_devtools dev_php_errors ;;
+      4) run_item header_devtools dev_benchmark ;;
+      5) run_item header_devtools dev_maintenance ;;
+      6) run_item header_devtools dev_basic_auth ;;
+      7) run_item header_devtools dev_opcache_clear ;;
+      8) run_item header_devtools dev_php_limits ;;
+      0) return ;;
+      *) msg_error "Opción inválida."; pause ;;
+    esac
+  done
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ESTADO GENERAL
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -3972,10 +4456,12 @@ main_menu() {
     echo -e "  ${GREEN}4)${RESET} ${BOLD}Git / Deploy${RESET}   — Deploy key, clone, pull, post-deploy"
     echo -e "  ${WHITE}5)${RESET} ${BOLD}Sistema${RESET}        — Hora, zona horaria, actualizaciones"
     echo -e "  ${RED}6)${RESET} ${BOLD}Seguridad${RESET}      — Firewall, fail2ban, SSH, auditoría"
-    echo -e "  ${WHITE}7)${RESET} ${BOLD}Estado${RESET}         — Resumen de servicios"
+    echo -e "  ${GREEN}7)${RESET} ${BOLD}Monitor${RESET}        — Dashboard en vivo (CPU, RAM, red, sitios)"
+    echo -e "  ${CYAN}8)${RESET} ${BOLD}Dev Tools${RESET}      — Logs, tráfico, benchmark, mantenimiento"
+    echo -e "  ${WHITE}9)${RESET} ${BOLD}Estado${RESET}         — Resumen estático de servicios"
     echo -e "  ${WHITE}0)${RESET} Salir"
     echo
-    read -rp "  Selecciona [0-7]: " opt; echo
+    read -rp "  Selecciona [0-9] (m = monitor): " opt; echo
 
     case "$opt" in
       1) menu_web_stack    || true ;;
@@ -3984,7 +4470,9 @@ main_menu() {
       4) menu_git          || true ;;
       5) menu_sistema      || true ;;
       6) menu_seguridad    || true ;;
-      7) show_system_status || true; pause ;;
+      7|m|M) run_dashboard || true ;;
+      8) menu_devtools     || true ;;
+      9) show_system_status || true; pause ;;
       0) echo; msg_ok "Hasta luego."; echo; exit 0 ;;
       *) msg_error "Opción inválida."; pause ;;
     esac
@@ -4025,6 +4513,7 @@ done
 setup_colors
 
 on_interrupt() {
+  tput cnorm 2>/dev/null || true
   echo
   msg_warn "Interrumpido por el usuario. Saliendo..."
   exit 130
