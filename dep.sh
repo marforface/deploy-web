@@ -475,7 +475,7 @@ fix_storage_permissions() {
   local sites=()
   mapfile -t sites < <(
     find /etc/nginx/sites-available -maxdepth 1 -type f -printf '%f\n' \
-      | grep -v '^default$' | grep -v '^000-catch-all$' | sort
+      | grep -v '^default$' | grep -v '^000-catch-all$' | grep -v '\.maintenance$' | sort
   )
 
   if [[ "${#sites[@]}" -eq 0 ]]; then
@@ -1056,7 +1056,7 @@ list_sites() {
   local sites=()
   mapfile -t sites < <(
     find /etc/nginx/sites-available -maxdepth 1 -type f -printf '%f\n' \
-      | grep -v '^default$' | grep -v '^000-catch-all$' | sort
+      | grep -v '^default$' | grep -v '^000-catch-all$' | grep -v '\.maintenance$' | sort
   )
   if [[ "${#sites[@]}" -eq 0 ]]; then msg_warn "No hay sitios configurados."; return 0; fi
 
@@ -1080,7 +1080,7 @@ choose_site() {
   local sites=() i=1 site opt
   mapfile -t sites < <(
     find /etc/nginx/sites-available -maxdepth 1 -type f -printf '%f\n' \
-      | grep -v '^default$' | grep -v '^000-catch-all$' | sort
+      | grep -v '^default$' | grep -v '^000-catch-all$' | grep -v '\.maintenance$' | sort
   )
   if [[ "${#sites[@]}" -eq 0 ]]; then
     msg_warn "No hay sitios configurados."
@@ -2012,7 +2012,7 @@ _cf_build_config() {
   local sites=()
   mapfile -t sites < <(
     find /etc/nginx/sites-enabled -maxdepth 1 -type l -printf '%f\n' \
-      | grep -Ev '^default$|^000-catch-all$' | sort
+      | grep -Ev '^default$|^000-catch-all$|\.maintenance$' | sort
   )
 
   local ingress_blocks=""
@@ -3001,7 +3001,7 @@ EOF
   local sites=() patched=0
   mapfile -t sites < <(
     find /etc/nginx/sites-available -maxdepth 1 -type f -printf '%f\n' \
-      | grep -Ev '^default$|^000-catch-all$' | sort
+      | grep -Ev '^default$|^000-catch-all$|\.maintenance$' | sort
   )
   for site in "${sites[@]}"; do
     local conf="/etc/nginx/sites-available/${site}"
@@ -3377,7 +3377,7 @@ run_dashboard() {
   local interval=3 cycles=0 key frame s i p pat
   mapfile -t MON_SITES < <(
     find /etc/nginx/sites-available -maxdepth 1 -type f -printf '%f\n' 2>/dev/null \
-      | grep -Ev '^default$|^000-catch-all$' | sort
+      | grep -Ev '^default$|^000-catch-all$|\.maintenance$' | sort
   )
   declare -gA MON_DU=()
   for s in "${MON_SITES[@]}"; do
@@ -3627,6 +3627,7 @@ dev_basic_auth() {
   read -rp "  Usuario: " user
   [[ -z "$user" ]] && { msg_error "Usuario obligatorio."; return 1; }
   htpasswd -c "$htfile" "$user"
+  chown root:www-data "$htfile"
   chmod 640 "$htfile"
 
   sed -i "/server_name /a\\    auth_basic \"Acceso restringido\";\\n    auth_basic_user_file ${htfile};" "$conf"
@@ -4042,7 +4043,7 @@ uninstall_web_stack() {
   local sites=() php_versions=()
   mapfile -t sites < <(
     find /etc/nginx/sites-available -maxdepth 1 -type f -printf '%f\n' 2>/dev/null \
-      | grep -Ev '^default$|^000-catch-all$' | sort
+      | grep -Ev '^default$|^000-catch-all$|\.maintenance$' | sort
   )
   mapfile -t php_versions < <(detect_installed_php_versions)
 
