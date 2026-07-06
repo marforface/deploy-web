@@ -1060,19 +1060,28 @@ list_sites() {
   )
   if [[ "${#sites[@]}" -eq 0 ]]; then msg_warn "No hay sitios configurados."; return 0; fi
 
-  printf "  %-22s %-8s %-35s %-25s %-10s\n" "SITIO" "ACTIVO" "SERVER_NAME" "RAÍZ" "MAX_UPLOAD"
-  printf '  %s\n' "$(printf '─%.0s' {1..104})"
+  printf "  %-22s %-8s %-6s %-33s %-23s %-10s\n" "SITIO" "ESTADO" "AUTH" "SERVER_NAME" "RAÍZ" "MAX_UPLOAD"
+  printf '  %s\n' "$(printf '─%.0s' {1..106})"
   for site in "${sites[@]}"; do
-    local mark sn root up
-    [[ -L "/etc/nginx/sites-enabled/${site}" ]] \
-      && mark="${GREEN}SÍ${RESET}" || mark="${RED}NO${RESET}"
+    local mark auth sn root up
+    if [[ -L "/etc/nginx/sites-enabled/${site}" ]]; then
+      if [[ "$(readlink -f "/etc/nginx/sites-enabled/${site}" 2>/dev/null)" == *.maintenance ]]; then
+        mark="${YELLOW}MANT${RESET}"
+      else
+        mark="${GREEN}SÍ${RESET}"
+      fi
+    else
+      mark="${RED}NO${RESET}"
+    fi
+    grep -q "auth_basic_user_file" "/etc/nginx/sites-available/${site}" 2>/dev/null \
+      && auth="${MAGENTA}SÍ${RESET}" || auth="${DIM}— ${RESET}"
     sn="$(awk '/server_name / && !/default_server/ {print $2; exit}' \
       "/etc/nginx/sites-available/${site}" | tr -d ';')"
     root="$(awk '/root / {print $2; exit}' \
       "/etc/nginx/sites-available/${site}" | tr -d ';')"
     up="$(awk '/client_max_body_size / {print $2; exit}' \
       "/etc/nginx/sites-available/${site}" | tr -d ';')"; up="${up:-—}"
-    printf "  %-22s %-16b %-35s %-25s %-10s\n" "$site" "$mark" "$sn" "$root" "$up"
+    printf "  %-22s %-16b %-14b %-33s %-23s %-10s\n" "$site" "$mark" "$auth" "$sn" "$root" "$up"
   done; echo
 }
 
@@ -1088,10 +1097,19 @@ choose_site() {
   fi
   echo; echo "  Selecciona un sitio:"; echo
   for site in "${sites[@]}"; do
-    local mark
-    [[ -L "/etc/nginx/sites-enabled/${site}" ]] \
-      && mark="${GREEN}[activo]${RESET}" || mark="${RED}[inactivo]${RESET}"
-    printf "  %d) %-25s %b\n" "$i" "$site" "$mark"; ((i++))
+    local mark extra=""
+    if [[ -L "/etc/nginx/sites-enabled/${site}" ]]; then
+      if [[ "$(readlink -f "/etc/nginx/sites-enabled/${site}" 2>/dev/null)" == *.maintenance ]]; then
+        mark="${YELLOW}[mantenimiento]${RESET}"
+      else
+        mark="${GREEN}[activo]${RESET}"
+      fi
+    else
+      mark="${RED}[inactivo]${RESET}"
+    fi
+    grep -q "auth_basic_user_file" "/etc/nginx/sites-available/${site}" 2>/dev/null \
+      && extra=" ${MAGENTA}[protegido]${RESET}"
+    printf "  %d) %-25s %b%b\n" "$i" "$site" "$mark" "$extra"; ((i++))
   done
   echo "  0) Cancelar"; echo
   read -rp "  Opción: " opt
@@ -3626,7 +3644,16 @@ dev_basic_auth() {
   local user
   read -rp "  Usuario: " user
   [[ -z "$user" ]] && { msg_error "Usuario obligatorio."; return 1; }
-  htpasswd -c "$htfile" "$user"
+
+  # Pide la contraseña dos veces y reintenta hasta que coincidan
+  prompt_password_generic "Contraseña del sitio"
+
+  if ! htpasswd -cbB "$htfile" "$user" "$DB_PASS_VALUE" 2>/dev/null; then
+    msg_error "htpasswd falló. No se aplicó ningún bloqueo al sitio."
+    rm -f "$htfile" 2>/dev/null || true
+    return 1
+  fi
+  DB_PASS_VALUE=""
   chown root:www-data "$htfile"
   chmod 640 "$htfile"
 
