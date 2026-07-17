@@ -2499,9 +2499,139 @@ cf_uninstall() {
 readonly NGINX_SEC_SNIPPET="/etc/nginx/snippets/security-headers.conf"
 
 _detect_ssh_port() {
+  # sshd -T resuelve Include y devuelve la config EFECTIVA (fuente de verdad).
+  # Si no está disponible, cae a leer sshd_config directo.
   local p
-  p="$(awk '/^[[:space:]]*Port[[:space:]]/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)"
+  if command -v sshd >/dev/null 2>&1; then
+    p="$(sshd -T 2>/dev/null | awk '/^port[[:space:]]/ {print $2; exit}')"
+  fi
+  if [[ -z "$p" ]]; then
+    p="$(awk '/^[[:space:]]*Port[[:space:]]/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)"
+  fi
   echo "${p:-22}"
+}
+
+_ssh_socket_active() {
+  # true si ssh.socket existe y está activo/habilitado (socket activation),
+  # que en imágenes cloud de Debian/Ubuntu puede fijar el puerto por su cuenta
+  # e ignorar silenciosamente el Port de sshd_config.
+  systemctl list-unit-files ssh.socket >/dev/null 2>&1 || return 1
+  systemctl is-enabled --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet ssh.socket 2>/dev/null
+}
+
+_ssh_listening_port() {
+  # Puerto(s) real(es) en los que el proceso sshd está escuchando ahora mismo.
+  ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | grep -oE '[0-9]+$' | sort -un | tr '\n' ',' | sed 's/,$//'
+}
+
+sec_ssh_diagnose() {
+  msg_section "Diagnóstico y reparación del puerto SSH"
+
+  local sshd=/etc/ssh/sshd_config
+  [[ ! -f "$sshd" ]] && { msg_warn "OpenSSH server no está instalado."; return 0; }
+
+  local cfg_port listen_port
+  cfg_port="$(_detect_ssh_port)"
+  listen_port="$(_ssh_listening_port)"
+
+  echo
+  printf "  %-38s %s\n" "Puerto configurado (sshd -T):"        "${cfg_port}"
+  printf "  %-38s %s\n" "Puerto(s) real(es) en escucha (ss):"  "${listen_port:-ninguno detectado}"
+  echo
+
+  local problems=0
+
+  # 1) Archivos en sshd_config.d/ que puedan traer su propio Port
+  local conf_dir="/etc/ssh/sshd_config.d"
+  local conflicting=()
+  if [[ -d "$conf_dir" ]]; then
+    mapfile -t conflicting < <(grep -lE '^[[:space:]]*Port[[:space:]]' "${conf_dir}"/*.conf 2>/dev/null)
+  fi
+  if [[ "${#conflicting[@]}" -gt 0 ]]; then
+    ((problems++)) || true
+    msg_error "Hay Port declarado en archivos de Include (pueden pisar tu sshd_config):"
+    local f
+    for f in "${conflicting[@]}"; do
+      echo "      ${f}:  $(grep -E '^[[:space:]]*Port[[:space:]]' "$f")"
+    done
+  else
+    msg_ok "Sin conflictos de 'Port' en ${conf_dir}/*.conf"
+  fi
+
+  # 2) ssh.socket (systemd socket activation) fijando el puerto por su cuenta
+  if _ssh_socket_active; then
+    ((problems++)) || true
+    msg_error "ssh.socket está activo/habilitado — controla el puerto de forma independiente"
+    msg_error "a sshd_config y puede hacer que SSH siga escuchando en el puerto viejo."
+    local sock_listen
+    sock_listen="$(systemctl show ssh.socket -p Listen 2>/dev/null | sed 's/^Listen=//')"
+    [[ -n "$sock_listen" ]] && echo "      ListenStream detectado: ${sock_listen}"
+  else
+    msg_ok "ssh.socket inactivo (SSH corre directo vía ssh.service, como se espera)"
+  fi
+
+  # 3) Config efectiva vs. puerto real en escucha
+  if [[ -n "$listen_port" ]] && [[ ",${listen_port}," != *",${cfg_port},"* ]]; then
+    ((problems++)) || true
+    msg_error "DESAJUSTE: sshd_config dice '${cfg_port}' pero sshd escucha en '${listen_port}'."
+  fi
+
+  echo
+  if [[ $problems -eq 0 ]]; then
+    msg_ok "Todo consistente. SSH escuchando correctamente en el puerto ${cfg_port}."
+    return 0
+  fi
+
+  msg_warn "Se detectaron ${problems} problema(s) que pueden causar pérdida de acceso SSH."
+  echo
+  prompt_yes_no "¿Aplicar la reparación automática ahora?" "s"
+  [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Diagnóstico finalizado sin cambios."; return 0; }
+
+  # Abrir el puerto configurado en UFW por si acaso, antes de reiniciar nada (anti-lockout)
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow "${cfg_port}/tcp" comment 'SSH' >/dev/null 2>&1 || true
+  fi
+
+  # Fix 1: comentar Port en archivos de Include (root causa más común)
+  local f
+  for f in "${conflicting[@]}"; do
+    cp "$f" "${f}.bak.$(date +%F-%H%M%S)"
+    sed -i -E "s/^([[:space:]]*Port[[:space:]].*)/# \1  # comentado por DevLab Manager (conflicto de puerto)/" "$f"
+    msg_ok "Comentado 'Port' en: ${f}"
+  done
+
+  # Fix 2: deshabilitar ssh.socket para que sshd_config mande de verdad
+  if _ssh_socket_active; then
+    systemctl stop ssh.socket 2>/dev/null || true
+    systemctl disable ssh.socket 2>/dev/null || true
+    msg_ok "ssh.socket detenido y deshabilitado."
+  fi
+
+  # Aplicar
+  if ! sshd -t 2>/dev/null; then
+    msg_error "sshd_config inválido tras los cambios. Revisa manualmente antes de reiniciar."
+    return 1
+  fi
+  systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
+  sleep 1
+
+  echo
+  local new_listen; new_listen="$(_ssh_listening_port)"
+  printf "  %-38s %s\n" "Puerto(s) en escucha ahora:" "${new_listen:-ninguno detectado}"
+  echo
+
+  if [[ ",${new_listen}," == *",${cfg_port},"* ]]; then
+    msg_ok "Reparado. SSH escucha correctamente en el puerto ${cfg_port}."
+    echo
+    msg_warn "PRUEBA AHORA desde OTRA terminal antes de cerrar esta sesión:"
+    echo "      ssh -p ${cfg_port} root@$(detect_primary_ip 2>/dev/null || echo '<IP>')"
+  else
+    msg_error "El puerto sigue sin coincidir. Revisa manualmente:"
+    echo "      sshd -T | grep -i '^port'"
+    echo "      ss -tlnp | grep sshd"
+    echo "      systemctl status ssh.socket"
+    return 1
+  fi
 }
 
 sec_install_ufw() {
@@ -2767,14 +2897,35 @@ sec_change_ssh_port() {
     break
   done
 
+  # Detectar de antemano posibles causas de que el cambio "no pegue"
+  local conf_dir="/etc/ssh/sshd_config.d"
+  local conflicting=()
+  [[ -d "$conf_dir" ]] && mapfile -t conflicting < <(grep -lE '^[[:space:]]*Port[[:space:]]' "${conf_dir}"/*.conf 2>/dev/null)
+  local socket_will_interfere="n"
+  _ssh_socket_active && socket_will_interfere="s"
+
   echo
   msg_warn "Pasos que se aplicarán:"
   echo "      1. Permitir ${new_port}/tcp en UFW (si está activo) ANTES del cambio"
   echo "      2. Cambiar Port en sshd_config y reiniciar SSH"
   echo "      3. Actualizar el puerto en fail2ban (si está instalado)"
-  echo "      4. La regla UFW del puerto antiguo (${old_port}) se elimina SOLO cuando confirmes"
+  echo "      4. Verificar que sshd quede escuchando REALMENTE en ${new_port} (no solo la config)"
+  echo "      5. La regla UFW del puerto antiguo (${old_port}) se elimina SOLO cuando confirmes"
   echo "         que ya probaste la conexión nueva."
   echo
+
+  if [[ "${#conflicting[@]}" -gt 0 ]]; then
+    msg_error "AVISO: ${conf_dir} tiene archivos que declaran su propio Port:"
+    local f; for f in "${conflicting[@]}"; do echo "      ${f}"; done
+    msg_error "Esto puede pisar el Port que vas a fijar. Se comentarán automáticamente."
+    echo
+  fi
+  if [[ "$socket_will_interfere" == "s" ]]; then
+    msg_error "AVISO: ssh.socket está activo — controla el puerto de forma independiente"
+    msg_error "de sshd_config y puede ignorar el cambio. Se deshabilitará automáticamente."
+    echo
+  fi
+
   prompt_yes_no "¿Aplicar el cambio de puerto ${old_port} → ${new_port}?" "n"
   [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado."; return 0; }
 
@@ -2792,15 +2943,43 @@ sec_change_ssh_port() {
     echo "Port ${new_port}" >> "$sshd"
   fi
 
+  # 2b) Neutralizar Port en Include que pisaría lo anterior
+  local f
+  for f in "${conflicting[@]}"; do
+    cp "$f" "${f}.bak.$(date +%F-%H%M%S)"
+    sed -i -E "s/^([[:space:]]*Port[[:space:]].*)/# \1  # comentado por DevLab Manager (conflicto de puerto)/" "$f"
+    msg_ok "Comentado 'Port' en: ${f}"
+  done
+
+  # 2c) Deshabilitar socket activation si está presente
+  if [[ "$socket_will_interfere" == "s" ]]; then
+    systemctl stop ssh.socket 2>/dev/null || true
+    systemctl disable ssh.socket 2>/dev/null || true
+    msg_ok "ssh.socket detenido y deshabilitado."
+  fi
+
   if ! sshd -t 2>/dev/null; then
     msg_error "sshd_config inválido. Restaurando backup..."
     cp "$(ls -t "${sshd}.bak."* | head -1)" "$sshd" 2>/dev/null || true
     return 1
   fi
   systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
-  msg_ok "SSH escuchando en el puerto ${new_port}."
+  sleep 1
 
-  # 3) fail2ban
+  # 3) Verificación REAL — no basta con "sshd -t" ni con confiar en el archivo
+  local listen_port; listen_port="$(_ssh_listening_port)"
+  if [[ ",${listen_port}," != *",${new_port},"* ]]; then
+    msg_error "sshd NO quedó escuchando en ${new_port} (escucha en: ${listen_port:-nada})."
+    msg_error "Restaurando el puerto anterior para no perder el acceso..."
+    cp "$(ls -t "${sshd}.bak."* | head -1)" "$sshd" 2>/dev/null || true
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
+    msg_warn "Revertido a puerto ${old_port}. Ejecuta el diagnóstico:"
+    echo "      Seguridad → Diagnosticar y reparar puerto SSH"
+    return 1
+  fi
+  msg_ok "SSH verificado escuchando en el puerto ${new_port} (config + socket coinciden)."
+
+  # 4) fail2ban
   if [[ -f /etc/fail2ban/jail.local ]]; then
     sed -i "s/^port    = .*/port    = ${new_port}/" /etc/fail2ban/jail.local
     systemctl restart fail2ban 2>/dev/null || true
@@ -3090,12 +3269,12 @@ sec_audit() {
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     _chk "UFW firewall" ok "activo"
   else
-    _chk "UFW firewall" warn "inactivo o no instalado (Seguridad → 6)"
+    _chk "UFW firewall" warn "inactivo o no instalado (Seguridad → 7)"
   fi
   if dpkg -s fail2ban >/dev/null 2>&1 && systemctl is-active --quiet fail2ban; then
     _chk "fail2ban" ok "activo"
   else
-    _chk "fail2ban" warn "inactivo o no instalado (Seguridad → 7)"
+    _chk "fail2ban" warn "inactivo o no instalado (Seguridad → 8)"
   fi
 
   echo; echo -e "  ${BOLD}── SSH ──${RESET}"
@@ -3111,10 +3290,24 @@ sec_audit() {
     && _chk "PasswordAuthentication" ok "no (solo claves)" \
     || _chk "PasswordAuthentication" warn "${pauth:-yes} — contraseñas permitidas"
 
+  local eff_port listen_port
+  eff_port="$(_detect_ssh_port)"
+  listen_port="$(_ssh_listening_port)"
+  if [[ -n "$listen_port" ]] && [[ ",${listen_port}," == *",${eff_port},"* ]]; then
+    _chk "Puerto SSH (config vs. real)" ok "${eff_port} — coincide con lo que escucha sshd"
+  else
+    _chk "Puerto SSH (config vs. real)" warn "config=${eff_port} pero escucha en ${listen_port:-nada} (Seguridad → Diagnosticar puerto SSH)"
+  fi
+  if _ssh_socket_active; then
+    _chk "ssh.socket (socket activation)" warn "activo — puede ignorar el Port de sshd_config (Seguridad → Diagnosticar puerto SSH)"
+  else
+    _chk "ssh.socket (socket activation)" ok "inactivo"
+  fi
+
   echo; echo -e "  ${BOLD}── Nginx ──${RESET}"
   [[ -f "$NGINX_SEC_SNIPPET" ]] \
     && _chk "Headers de seguridad" ok "snippet instalado" \
-    || _chk "Headers de seguridad" warn "sin configurar (Seguridad → 8)"
+    || _chk "Headers de seguridad" warn "sin configurar (Seguridad → 9)"
   grep -rq "server_tokens off" /etc/nginx/ 2>/dev/null \
     && _chk "server_tokens" ok "off (versión oculta)" \
     || _chk "server_tokens" warn "versión de Nginx expuesta"
@@ -3163,7 +3356,7 @@ sec_audit() {
   echo; echo -e "  ${BOLD}── Sistema ──${RESET}"
   dpkg -s unattended-upgrades >/dev/null 2>&1 \
     && _chk "Actualizaciones automáticas" ok "habilitadas" \
-    || _chk "Actualizaciones automáticas" warn "sin configurar (Seguridad → 9)"
+    || _chk "Actualizaciones automáticas" warn "sin configurar (Seguridad → 10)"
   local pending
   pending="$(apt list --upgradable 2>/dev/null | grep -c "security" || true)"
   [[ "${pending:-0}" -eq 0 ]] \
@@ -3184,16 +3377,18 @@ sec_harden_all() {
   msg_section "Blindaje completo del entorno"
   echo "  Se aplicarán en secuencia (cada paso pide su propia confirmación):"
   echo
-  echo "    1. Firewall UFW"
-  echo "    2. fail2ban"
-  echo "    3. Endurecer SSH"
-  echo "    4. Headers de seguridad Nginx"
-  echo "    5. Actualizaciones de seguridad automáticas"
-  echo "    6. Auditoría final"
+  echo "    1. Diagnóstico de puerto SSH (socket activation / Include)"
+  echo "    2. Firewall UFW"
+  echo "    3. fail2ban"
+  echo "    4. Endurecer SSH"
+  echo "    5. Headers de seguridad Nginx"
+  echo "    6. Actualizaciones de seguridad automáticas"
+  echo "    7. Auditoría final"
   echo
   prompt_yes_no "¿Comenzar el blindaje completo?" "s"
   [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado."; return 0; }
 
+  echo; sec_ssh_diagnose      || true
   echo; sec_install_ufw       || true
   echo; sec_install_fail2ban  || true
   echo; sec_harden_ssh        || true
@@ -3220,14 +3415,15 @@ menu_seguridad() {
     echo -e "  ${RED}3)${RESET} Acceso por clave SSH desde tu Mac  (autorizar clave + guía)"
     echo -e "  ${RED}4)${RESET} Habilitar / Deshabilitar acceso SSH por contraseña"
     echo -e "  ${RED}5)${RESET} Cambiar puerto SSH"
+    echo -e "  ${RED}6)${RESET} Diagnosticar y reparar puerto SSH  (socket activation / Include)"
     menu_cat "Red y fuerza bruta" "$RED"
-    echo -e "  ${RED}6)${RESET} Firewall UFW  (deny incoming + SSH/HTTP/HTTPS)"
-    echo -e "  ${RED}7)${RESET} fail2ban  (anti fuerza bruta: SSH + Nginx)"
+    echo -e "  ${RED}7)${RESET} Firewall UFW  (deny incoming + SSH/HTTP/HTTPS)"
+    echo -e "  ${RED}8)${RESET} fail2ban  (anti fuerza bruta: SSH + Nginx)"
     menu_cat "Web y sistema" "$RED"
-    echo -e "  ${RED}8)${RESET} Headers de seguridad Nginx  (+ ocultar versión)"
-    echo -e "  ${RED}9)${RESET} Actualizaciones de seguridad automáticas"
+    echo -e "  ${RED}9)${RESET} Headers de seguridad Nginx  (+ ocultar versión)"
+    echo -e "  ${RED}10)${RESET} Actualizaciones de seguridad automáticas"
     menu_cat "Verificación" "$RED"
-    echo -e "  ${RED}10)${RESET} Auditoría de seguridad  (chequeo completo del entorno)"
+    echo -e "  ${RED}11)${RESET} Auditoría de seguridad  (chequeo completo del entorno)"
     echo
     echo -e "  ${RED}0)${RESET} ← Volver al menú principal"
     echo
@@ -3238,11 +3434,12 @@ menu_seguridad() {
       3)  run_item header_seguridad sec_ssh_key_access ;;
       4)  run_item header_seguridad sec_ssh_password_toggle ;;
       5)  run_item header_seguridad sec_change_ssh_port ;;
-      6)  run_item header_seguridad sec_install_ufw ;;
-      7)  run_item header_seguridad sec_install_fail2ban ;;
-      8)  run_item header_seguridad sec_nginx_headers ;;
-      9)  run_item header_seguridad sec_auto_updates ;;
-      10) run_item header_seguridad sec_audit ;;
+      6)  run_item header_seguridad sec_ssh_diagnose ;;
+      7)  run_item header_seguridad sec_install_ufw ;;
+      8)  run_item header_seguridad sec_install_fail2ban ;;
+      9)  run_item header_seguridad sec_nginx_headers ;;
+      10) run_item header_seguridad sec_auto_updates ;;
+      11) run_item header_seguridad sec_audit ;;
       0)  return ;;
       *)  msg_error "Opción inválida."; pause ;;
     esac
