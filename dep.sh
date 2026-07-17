@@ -3009,8 +3009,13 @@ add_header X-XSS-Protection       "1; mode=block"                       always;
 EOF
   msg_ok "Snippet creado: ${NGINX_SEC_SNIPPET}"
 
-  # Ocultar versión de Nginx globalmente
-  if ! grep -q "server_tokens off" /etc/nginx/conf.d/security.conf 2>/dev/null; then
+  # Ocultar versión de Nginx globalmente (evita directiva duplicada si ya
+  # está definida en nginx.conf u otro conf.d, lo que hace fallar nginx -t)
+  if grep -q "server_tokens off" /etc/nginx/conf.d/security.conf 2>/dev/null; then
+    : # ya presente en security.conf, nada que hacer
+  elif grep -rq "server_tokens off" --exclude="security.conf" /etc/nginx/ 2>/dev/null; then
+    msg_info "server_tokens off ya está configurado en Nginx (no se duplica)."
+  else
     echo "server_tokens off;" > /etc/nginx/conf.d/security.conf
     msg_ok "server_tokens off (versión de Nginx oculta en headers y errores)."
   fi
