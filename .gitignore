@@ -213,4 +213,15 @@ prepros.config
 
 # End of https://www.toptal.com/developers/gitignore/api/macos,webstorm,prepros,intellij+all
 
-.claude
+# Configuración local y artefactos sensibles del operador
+/.claude/
+/.idea/
+/.vscode/
+.env
+.env.*
+!.env.example
+*.bak
+*.bak.*
+*.log
+*.sql
+*.sql.gz

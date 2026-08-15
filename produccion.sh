@@ -1,18 +1,26 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  DevLab Manager v1.7 - Marcos Espinoza Torres
-#  Stack completo: Nginx · PHP-FPM · MariaDB · Cloudflared | Debian 12/13
+#  DevLab Manager v2.0 - Marcos Espinoza Torres
+#  Stack completo: Nginx · PHP-FPM · MySQL/MariaDB · Cloudflared | Debian 12/13
 # ==============================================================================
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.8 - Marcos Espinoza Torres"
+readonly SCRIPT_VERSION="2.0 - Marcos Espinoza Torres"
 readonly CATCH_ALL_FILE="/etc/nginx/sites-available/000-catch-all"
 readonly MARIADB_CNF="/etc/mysql/mariadb.conf.d/50-server.cnf"
+readonly MYSQL_CNF="/etc/mysql/mysql.conf.d/mysqld.cnf"
+readonly MYSQL_OVERRIDE_CNF="/etc/mysql/mysql.conf.d/99-devlab-manager.cnf"
+readonly MARIADB_BACKUP_DIR="/var/backups/mariadb"
+readonly MYSQL_BACKUP_DIR="/var/backups/mysql"
 readonly SESSION_OPTIONS=(2 4 8 16 24)
 readonly PHP_SUPPORTED_VERSIONS=(8.1 8.2 8.3 8.4)
 readonly CLOUDFLARED_CONFIG="/etc/cloudflared/config.yml"
 readonly CLOUDFLARED_DIR="/etc/cloudflared"
 readonly GIT_DEPLOY_KEY="/root/.ssh/deploy_ed25519"
+readonly CROWDSEC_KEYRING="/etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg"
+readonly CROWDSEC_SOURCE="/etc/apt/sources.list.d/crowdsec_crowdsec.list"
+readonly CROWDSEC_ACQUIS="/etc/crowdsec/acquis.d/devlab-nginx.yaml"
+readonly SITE_BACKUP_DIR="/var/backups/devlab/sites"
 
 PHP_VERSION=""
 DEBIAN_CODENAME=""
@@ -24,7 +32,6 @@ DB_PORT=""
 DB_NAME=""
 DB_USER=""
 CREATE_ENV_FILE="s"
-ENABLE_ROOT_SSH="n"
 APP_DIR=""
 UPLOAD_MAX_SIZE=""
 PRIMARY_HOST=""
@@ -101,8 +108,36 @@ valid_port()     { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
 valid_app_name() { [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; }
 valid_db_name()  { [[ "$1" =~ ^[a-zA-Z0-9_]+$ ]]; }
 valid_db_user()  { [[ "$1" =~ ^[a-zA-Z0-9_]+$ ]]; }
+valid_db_host()  { [[ "$1" == "localhost" || "$1" == "%" || "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){0,3}(\.%|\.[0-9]{1,3})*$ || "$1" =~ ^[a-zA-Z0-9.-]+$ ]]; }
 valid_size()     { [[ "$1" =~ ^[0-9]+[MG]$ ]]; }
 valid_fqdn()     { [[ "$1" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; }
+
+valid_ipv4_or_cidr() {
+  local value="$1" ip="$1" prefix=""
+  if [[ "$value" == */* ]]; then
+    ip="${value%/*}"; prefix="${value##*/}"
+    [[ "$prefix" =~ ^[0-9]+$ ]] && (( prefix >= 0 && prefix <= 32 )) || return 1
+  fi
+  valid_ip "$ip"
+}
+
+valid_git_repo_url() {
+  [[ "$1" =~ ^git@github\.com:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(\.git)?$ ||
+     "$1" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(\.git)?$ ]]
+}
+
+valid_git_branch() {
+  command -v git >/dev/null 2>&1 && git check-ref-format --branch "$1" >/dev/null 2>&1
+}
+
+dotenv_quote() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//\$/\\\$}"
+  value="${value//\`/\\\`}"
+  printf '"%s"' "$value"
+}
 
 prompt_yes_no() {
   local prompt="$1" default="${2:-n}" answer=""
@@ -181,6 +216,7 @@ prompt_host_scope() {
     case "$choice" in
       1) REPLY_HOST="localhost";     return 0 ;;
       2) read -rp "  IP autorizada: " remote_host
+         valid_ip "$remote_host" || { msg_error "IP inválida."; continue; }
          REPLY_HOST="$remote_host"; return 0 ;;
       3) REPLY_HOST="192.168.11.%"; return 0 ;;
       4) REPLY_HOST="%";            return 0 ;;
@@ -322,8 +358,16 @@ install_base_stack() {
 
   msg_info "[4/6] Agregando repositorio Sury para PHP ${PHP_VERSION} (${DEBIAN_CODENAME})..."
   install -d -m 0755 /usr/share/keyrings
-  wget -qO /usr/share/keyrings/deb.sury.org-php.gpg \
-    https://packages.sury.org/php/apt.gpg
+  local sury_key_tmp
+  sury_key_tmp="$(mktemp)"
+  if ! curl --fail --silent --show-error --location \
+      https://packages.sury.org/php/apt.gpg --output "$sury_key_tmp"; then
+    rm -f "$sury_key_tmp"
+    msg_error "No se pudo descargar la clave del repositorio Sury."
+    return 1
+  fi
+  install -m 0644 "$sury_key_tmp" /usr/share/keyrings/deb.sury.org-php.gpg
+  rm -f "$sury_key_tmp"
   echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] \
 https://packages.sury.org/php/ ${DEBIAN_CODENAME} main" \
     > /etc/apt/sources.list.d/php.list
@@ -468,9 +512,27 @@ _apply_writable_perms() {
   done
 }
 
+_apply_site_code_perms() {
+  local app_dir="$1"
+  [[ -d "$app_dir" ]] || return 0
+
+  # El proceso web puede leer el código, pero no modificarlo. Solo los
+  # directorios declarados como escribibles quedan bajo control de www-data.
+  chown -R root:www-data "$app_dir"
+  find "$app_dir" -type d -not -path "${app_dir}/.git*" -exec chmod 755 {} \;
+  find "$app_dir" -type f -not -path "${app_dir}/.git/*" -exec chmod 644 {} \;
+  if [[ -d "${app_dir}/.git" ]]; then
+    chown -R root:root "${app_dir}/.git"
+    find "${app_dir}/.git" -type d -exec chmod 700 {} \;
+    find "${app_dir}/.git" -type f -exec chmod 600 {} \;
+  fi
+  [[ -f "${app_dir}/.env" ]] && chown root:www-data "${app_dir}/.env" && chmod 640 "${app_dir}/.env"
+  _apply_writable_perms "$app_dir"
+}
+
 fix_storage_permissions() {
   ensure_web_stack_installed || return 1
-  msg_section "Reparar permisos de storage y uploads"
+  msg_section "Reparar permisos de código, storage y uploads"
 
   local sites=()
   mapfile -t sites < <(
@@ -516,13 +578,13 @@ fix_storage_permissions() {
   if [[ "$opt" == "a" || "$opt" == "A" ]]; then
     for site in "${sites[@]}"; do
       msg_info "Reparando: ${site}"
-      _apply_writable_perms "/var/www/${site}"
+      _apply_site_code_perms "/var/www/${site}"
     done
     msg_ok "Permisos reparados en todos los sitios."
   elif [[ "$opt" =~ ^[0-9]+$ ]] && (( opt >= 1 && opt <= ${#sites[@]} )); then
     local site="${sites[$((opt-1))]}"
     msg_info "Reparando: ${site}"
-    _apply_writable_perms "/var/www/${site}"
+    _apply_site_code_perms "/var/www/${site}"
     msg_ok "Listo."
   else
     msg_error "Opción inválida."; return 1
@@ -530,6 +592,8 @@ fix_storage_permissions() {
 
   echo
   msg_info "Permisos aplicados:"
+  printf '  %-30s %s\n' "Código:"                 "root:www-data, solo lectura para el servicio web"
+  printf '  %-30s %s\n' ".git/:"                  "root:root, 700/600"
   printf '  %-30s %s\n' "Directorios writable:"   "2775 + setgid (grupo www-data)"
   printf '  %-30s %s\n' "Archivos dentro:"         "664"
   if command -v setfacl >/dev/null 2>&1; then
@@ -609,8 +673,9 @@ prompt_common_site_data() {
 
   while true; do
     read -rp "  IP/hostname del servidor MariaDB: " DB_HOST
-    [[ -n "$DB_HOST" ]] && break
-    msg_error "Host MariaDB obligatorio."
+    [[ -z "$DB_HOST" ]] && { msg_error "Host MariaDB obligatorio."; continue; }
+    valid_db_host "$DB_HOST" && break
+    msg_error "Host MariaDB inválido."
   done
 
   while true; do
@@ -642,9 +707,6 @@ prompt_common_site_data() {
   prompt_yes_no "¿Crear archivo .env con credenciales?" "s"
   CREATE_ENV_FILE="$REPLY_YESNO"
 
-  prompt_yes_no "¿Habilitar SSH root por contraseña (solo lab/admin)?" "n"
-  ENABLE_ROOT_SSH="$REPLY_YESNO"
-
   APP_DIR="/var/www/${APP_NAME}"
 }
 
@@ -660,58 +722,32 @@ echo "<p>Sitio PHP operativo en ${PRIMARY_HOST}</p>";
 echo "<p>PHP version: " . PHP_VERSION . "</p>";
 PHP
 
-  cat > "${APP_DIR}/public/test-db.php" <<PHP
-<?php
-declare(strict_types=1);
-\$host = '${DB_HOST}';
-\$port = '${DB_PORT}';
-\$db   = '${DB_NAME}';
-\$user = '${DB_USER}';
-\$pass = '${APP_DB_PASS}';
-try {
-    \$dsn = "mysql:host={\$host};port={\$port};dbname={\$db};charset=utf8mb4";
-    \$pdo = new PDO(\$dsn, \$user, \$pass, [
-        PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
-        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-    ]);
-    \$row = \$pdo->query("SELECT NOW() AS server_time, DATABASE() AS db_name")->fetch();
-    echo "<h1>Conexión PDO OK</h1><pre>"; print_r(\$row); echo "</pre>";
-} catch (Throwable \$e) {
-    http_response_code(500);
-    echo "<h1>Error de conexión</h1><pre>"
-       . htmlspecialchars(\$e->getMessage(), ENT_QUOTES, 'UTF-8')
-       . "</pre>";
-}
-PHP
-
-  cat > "${APP_DIR}/public/info.php" <<PHP
-<?php
-// ⚠ ELIMINAR EN PRODUCCIÓN — solo diagnóstico de lab
-phpinfo();
-PHP
-
   if [[ "${CREATE_ENV_FILE}" == "s" ]]; then
+    local env_app_name env_app_url env_db_host env_db_name env_db_user env_db_pass
+    env_app_name="$(dotenv_quote "$APP_NAME")"
+    env_app_url="$(dotenv_quote "https://${PRIMARY_HOST}")"
+    env_db_host="$(dotenv_quote "$DB_HOST")"
+    env_db_name="$(dotenv_quote "$DB_NAME")"
+    env_db_user="$(dotenv_quote "$DB_USER")"
+    env_db_pass="$(dotenv_quote "$APP_DB_PASS")"
     cat > "${APP_DIR}/.env" <<EOF
-APP_NAME=${APP_NAME}
-APP_ENV=development
-APP_URL=http://${PRIMARY_HOST}
+APP_NAME=${env_app_name}
+APP_ENV=production
+APP_DEBUG=false
+APP_URL=${env_app_url}
 
 DB_CONNECTION=mysql
-DB_HOST=${DB_HOST}
+DB_HOST=${env_db_host}
 DB_PORT=${DB_PORT}
-DB_DATABASE=${DB_NAME}
-DB_USERNAME=${DB_USER}
-DB_PASSWORD=${APP_DB_PASS}
+DB_DATABASE=${env_db_name}
+DB_USERNAME=${env_db_user}
+DB_PASSWORD=${env_db_pass}
 EOF
   fi
 
-  chown -R www-data:www-data "${APP_DIR}"
-  find "${APP_DIR}" -type d -exec chmod 755 {} \;
-  find "${APP_DIR}" -type f -exec chmod 644 {} \;
-  [[ -f "${APP_DIR}/.env" ]] && chmod 640 "${APP_DIR}/.env"
-
-  # Permisos de escritura para storage y uploads
-  _apply_writable_perms "${APP_DIR}"
+  _apply_site_code_perms "${APP_DIR}"
+  APP_DB_PASS=""
+  DB_PASS_VALUE=""
 }
 
 nginx_php_location_block() {
@@ -719,13 +755,16 @@ nginx_php_location_block() {
     location / {
         try_files \$uri \$uri/ /index.php?\$query_string;
     }
+    location ~* ^/uploads/.*\.(php|phtml|phar)$ {
+        return 404;
+    }
     location ~ \.php$ {
         include snippets/fastcgi-php.conf;
         fastcgi_pass unix:/run/php/php${PHP_VERSION}-fpm.sock;
         fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
         include fastcgi_params;
     }
-    location ~ /\.(ht|env) { deny all; }
+    location ~ (^|/)\. { deny all; }
 EOF
 }
 
@@ -833,8 +872,7 @@ change_upload_limits() {
 
   # Nginx usa post_max_size como techo (es el límite real del request HTTP)
   sed -i "s/client_max_body_size\s*[^;]*/client_max_body_size ${new_post}/" "$nginx_conf"
-  if nginx -t >/dev/null 2>&1; then
-    systemctl reload nginx
+  if nginx -t >/dev/null 2>&1 && systemctl reload nginx; then
     msg_ok "Nginx: client_max_body_size → ${new_post}"
   else
     msg_error "Validación Nginx falló. Revisa ${nginx_conf}."; return 1
@@ -867,22 +905,6 @@ enable_nginx_site() {
   systemctl reload nginx
 }
 
-setup_ssh_if_requested() {
-  [[ "${ENABLE_ROOT_SSH}" != "s" ]] && return 0
-  apt-get install -y openssh-server
-  systemctl enable --now ssh
-  cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%F-%H%M%S)"
-  local sshd=/etc/ssh/sshd_config
-  grep -q '^[#[:space:]]*PermitRootLogin' "$sshd" \
-    && sed -i 's/^[#[:space:]]*PermitRootLogin.*/PermitRootLogin yes/' "$sshd" \
-    || echo 'PermitRootLogin yes' >> "$sshd"
-  grep -q '^[#[:space:]]*PasswordAuthentication' "$sshd" \
-    && sed -i 's/^[#[:space:]]*PasswordAuthentication.*/PasswordAuthentication yes/' "$sshd" \
-    || echo 'PasswordAuthentication yes' >> "$sshd"
-  systemctl restart ssh
-  msg_warn "SSH root por contraseña: habilitado."
-}
-
 print_creation_summary() {
   echo
   echo -e "${BOLD}${GREEN}  ╔══════════════════════════════════════════╗${RESET}"
@@ -893,15 +915,13 @@ print_creation_summary() {
   printf '  %-22s %s\n' "Dominio:"           "http://${PRIMARY_HOST}"
   printf '  %-22s %s\n' "Raíz app:"          "${APP_DIR}/public"
   printf '  %-22s %s\n' "Uploads:"           "${APP_DIR}/public/uploads"
-  printf '  %-22s %s\n' "Test DB:"           "http://${PRIMARY_HOST}/test-db.php"
-  printf '  %-22s %s\n' "phpinfo:"           "http://${PRIMARY_HOST}/info.php"
   printf '  %-22s %s\n' "DB host:puerto:"    "${DB_HOST}:${DB_PORT}"
   printf '  %-22s %s\n' "DB nombre/usuario:" "${DB_NAME} / ${DB_USER}"
   printf '  %-22s %s\n' "Máx. subida:"       "${UPLOAD_MAX_SIZE}"
   [[ "${CREATE_ENV_FILE}" == "s" ]] \
     && printf '  %-22s %s\n' "Archivo .env:" "${APP_DIR}/.env"
   echo
-  msg_warn "Elimina test-db.php e info.php antes de pasar a producción."
+  msg_ok "Código protegido contra escritura de www-data; solo storage/uploads son escribibles."
   echo
   echo "  Bloque para config.yml de cloudflared:"
   echo "  - hostname: ${PRIMARY_HOST}"
@@ -913,8 +933,6 @@ print_creation_summary() {
   echo
   echo "  Pruebas rápidas:"
   echo "    curl -I -H 'Host: ${PRIMARY_HOST}' http://${SERVER_IP}"
-  echo "    curl -H 'Host: ${PRIMARY_HOST}' http://${SERVER_IP}/test-db.php"
-  echo "    curl -H 'Host: ${PRIMARY_HOST}' http://${SERVER_IP}/info.php"
 }
 
 create_site_custom_domain() {
@@ -932,10 +950,7 @@ create_site_custom_domain() {
   msg_info "[3/5] Ajustando límites PHP-FPM..."
   configure_php_upload_limits
 
-  msg_info "[4/5] Configurando SSH opcional..."
-  setup_ssh_if_requested
-
-  msg_info "[5/5] Finalizado."
+  msg_info "[4/4] Finalizado."
   print_creation_summary
 
   if cf_installed; then
@@ -1139,10 +1154,9 @@ test_site() {
   echo
   local ip; ip="$(detect_primary_ip 2>/dev/null || echo '<IP>')"
   echo "  Pruebas sugeridas:"
-  echo "    curl -I http://${sn}"
-  echo "    curl http://${sn}/test-db.php"
-  echo "    curl http://${sn}/info.php"
+  echo "    curl -I https://${sn}"
   echo "    curl -v -H 'Host: ${sn}' http://${ip}"
+  echo "    curl -I -H 'Host: ${sn}' http://${ip}/.env  # debe responder 403/404"
 }
 
 delete_site() {
@@ -1218,20 +1232,135 @@ reload_services() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MARIADB
+# MYSQL / MARIADB
 # ══════════════════════════════════════════════════════════════════════════════
 
-mariadb_installed() { dpkg -s mariadb-server >/dev/null 2>&1; }
-mariadb_running()   { systemctl is-active --quiet mariadb; }
+db_engine() {
+  local has_mariadb=0 has_mysql=0
+  dpkg -s mariadb-server >/dev/null 2>&1 && has_mariadb=1
+  { dpkg -s mysql-server >/dev/null 2>&1 || dpkg -s mysql-community-server >/dev/null 2>&1; } \
+    && has_mysql=1
+  if (( has_mariadb && has_mysql )); then
+    echo "conflict"
+  elif (( has_mariadb )); then
+    echo "mariadb"
+  elif (( has_mysql )); then
+    echo "mysql"
+  fi
+}
+
+db_label() {
+  case "$(db_engine)" in
+    mariadb) echo "MariaDB" ;;
+    mysql)   echo "MySQL" ;;
+    *)       echo "MySQL / MariaDB" ;;
+  esac
+}
+
+db_service() {
+  case "$(db_engine)" in
+    mariadb) echo "mariadb" ;;
+    mysql)   echo "mysql" ;;
+  esac
+}
+
+db_cli_bin() {
+  case "$(db_engine)" in
+    mariadb) [[ -n "$(type -P mariadb)" ]] && echo "mariadb" || echo "mysql" ;;
+    mysql)   echo "mysql" ;;
+  esac
+}
+
+db_dump_bin() {
+  case "$(db_engine)" in
+    mariadb) command -v mariadb-dump >/dev/null 2>&1 && echo "mariadb-dump" || echo "mysqldump" ;;
+    mysql)   echo "mysqldump" ;;
+  esac
+}
+
+db_config_file() {
+  case "$(db_engine)" in
+    mariadb) echo "$MARIADB_CNF" ;;
+    mysql)
+      [[ -f "$MYSQL_OVERRIDE_CNF" ]] && echo "$MYSQL_OVERRIDE_CNF" \
+        || [[ -f "$MYSQL_CNF" ]] && echo "$MYSQL_CNF" \
+        || echo "$MYSQL_OVERRIDE_CNF"
+      ;;
+  esac
+}
+
+db_backup_dir() {
+  [[ "$(db_engine)" == "mysql" ]] && echo "$MYSQL_BACKUP_DIR" || echo "$MARIADB_BACKUP_DIR"
+}
+
+db_cli() {
+  local bin
+  bin="$(db_cli_bin)"
+  [[ -n "$bin" ]] || { msg_error "No se encontró el cliente SQL."; return 127; }
+  command "$bin" "$@"
+}
+
+db_dump() {
+  local bin
+  bin="$(db_dump_bin)"
+  [[ -n "$bin" ]] || { msg_error "No se encontró la utilidad de backup SQL."; return 127; }
+  command "$bin" "$@"
+}
+
+db_sql_escape() {
+  # Escapa una cadena para usarla dentro de un literal SQL entre comillas simples.
+  # MySQL interpreta backslash y apóstrofe dentro del literal.
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e "s/'/''/g"
+}
+
+# Compatibilidad: las funciones históricas del script usan el comando mariadb.
+# Este wrapper las hace funcionar sin cambios con MySQL Community Server.
+mariadb()   { db_cli "$@"; }
+mysqldump() { db_dump "$@"; }
+
+mariadb_installed() { [[ "$(db_engine)" =~ ^(mariadb|mysql)$ ]]; }
+mariadb_running() {
+  local service
+  service="$(db_service)"
+  [[ -n "$service" ]] && systemctl is-active --quiet "$service"
+}
 
 require_mariadb() {
-  if ! mariadb_installed; then
-    msg_error "MariaDB no está instalado. Usa: MariaDB → opción 1."; return 1
+  local engine service label
+  engine="$(db_engine)"
+  label="$(db_label)"
+  if [[ "$engine" == "conflict" ]]; then
+    msg_error "Se detectaron MySQL y MariaDB instalados. No deben coexistir en el mismo LXC."
+    msg_info "Mantén un solo motor antes de continuar."
+    return 1
   fi
-  if ! mariadb_running; then
-    msg_warn "MariaDB instalado pero inactivo. Iniciando..."
-    systemctl enable --now mariadb
+  if [[ -z "$engine" ]]; then
+    msg_error "No hay motor SQL instalado. Usa: MySQL / MariaDB → opción 1."
+    return 1
   fi
+  service="$(db_service)"
+  if ! systemctl is-active --quiet "$service"; then
+    msg_warn "${label} instalado pero inactivo. Iniciando..."
+    systemctl enable --now "$service"
+  fi
+}
+
+prompt_db_name() {
+  local value=""
+  while true; do
+    read -rp "  Nombre de la base de datos: " value
+    valid_db_name "$value" && { REPLY_DB_NAME="$value"; return 0; }
+    msg_error "Nombre inválido. Usa letras, números y guion bajo."
+  done
+}
+
+prompt_db_user() {
+  local value=""
+  while true; do
+    read -rp "  Usuario $(db_label): " value
+    valid_db_user "$value" && { REPLY_DB_USER="$value"; return 0; }
+    msg_error "Usuario inválido. Usa letras, números y guion bajo."
+  done
 }
 
 _select_app_user() {
@@ -1241,11 +1370,12 @@ _select_app_user() {
   local raw=()
   mapfile -t raw < <(
     mariadb -sNe "SELECT User, Host FROM mysql.user
-                  WHERE User NOT IN ('root','mariadb.sys','mysql')
+                  WHERE User NOT IN ('root','mariadb.sys','mysql','mysql.sys',
+                                     'mysql.session','mysql.infoschema')
                   ORDER BY User, Host;" 2>/dev/null
   )
   if [[ "${#raw[@]}" -eq 0 ]]; then
-    msg_warn "No hay usuarios de aplicación en MariaDB."
+    msg_warn "No hay usuarios de aplicación en $(db_label)."
     return 1
   fi
 
@@ -1275,22 +1405,55 @@ _select_app_user() {
 }
 
 install_mariadb() {
-  if mariadb_installed; then
-    msg_warn "MariaDB ya está instalado."
-    systemctl enable --now mariadb
+  local engine service
+  engine="$(db_engine)"
+  if [[ "$engine" == "conflict" ]]; then
+    msg_error "MySQL y MariaDB están instalados simultáneamente. Resuelve el conflicto antes de continuar."
+    return 1
+  fi
+  if [[ -n "$engine" ]]; then
+    service="$(db_service)"
+    msg_warn "$(db_label) ya está instalado."
+    systemctl enable --now "$service"
     msg_ok "Servicio activo y habilitado."
     msg_info "Puedes endurecer con: mysql_secure_installation"
     return 0
   fi
+
+  msg_section "Instalar motor SQL"
+  echo "  1) MariaDB Server      — recomendado para Debian; instalación nativa"
+  echo "  2) MySQL Community     — requiere paquete mysql-server en los repositorios activos"
+  echo "  0) Cancelar"
+  echo
+  local opt package client label
+  read -rp "  Opción: " opt
+  case "$opt" in
+    1) package="mariadb-server"; client="mariadb-client"; label="MariaDB" ;;
+    2) package="mysql-server";   client="mysql-client";   label="MySQL Community" ;;
+    0) return 0 ;;
+    *) msg_error "Opción inválida."; return 1 ;;
+  esac
+
   msg_info "[1/3] Actualizando repositorios..."
   apt-get update
-  msg_info "[2/3] Instalando MariaDB..."
-  apt-get install -y mariadb-server mariadb-client
+  if ! apt-cache show "$package" >/dev/null 2>&1; then
+    msg_error "El paquete ${package} no está disponible en los repositorios configurados."
+    if [[ "$package" == "mysql-server" ]]; then
+      msg_info "Debian usa MariaDB como motor predeterminado. Para MySQL Community agrega primero"
+      msg_info "el repositorio oficial de MySQL y vuelve a ejecutar esta opción."
+      echo "      https://dev.mysql.com/downloads/repo/apt/"
+    fi
+    return 1
+  fi
+  msg_info "[2/3] Instalando ${label}..."
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "$package" "$client"
+  service="$(db_service)"
+  [[ -n "$service" ]] || { msg_error "No se pudo detectar el servicio SQL instalado."; return 1; }
   msg_info "[3/3] Habilitando servicio..."
-  systemctl enable --now mariadb
+  systemctl enable --now "$service"
   echo
-  msg_ok "MariaDB instalado y habilitado."
-  msg_info "Recuerda ejecutar: mysql_secure_installation"
+  msg_ok "$(db_label) instalado y habilitado."
+  msg_info "Siguiente paso recomendado: mysql_secure_installation"
 }
 
 configure_bind_address() {
@@ -1312,46 +1475,76 @@ configure_bind_address() {
     *) msg_error "Opción inválida."; return 1 ;;
   esac
 
-  cp "$MARIADB_CNF" "${MARIADB_CNF}.bak.$(date +%F-%H%M%S)"
-  if grep -q '^[#[:space:]]*bind-address' "$MARIADB_CNF"; then
-    sed -i "s/^[#[:space:]]*bind-address.*/bind-address = ${ip_val}/" "$MARIADB_CNF"
-  else
-    echo "bind-address = ${ip_val}" >> "$MARIADB_CNF"
+  local cnf service
+  cnf="$(db_config_file)"
+  service="$(db_service)"
+  if [[ ! -f "$cnf" ]]; then
+    if [[ "$(db_engine)" == "mysql" ]]; then
+      install -d -m 0755 "$(dirname "$cnf")"
+      printf '[mysqld]\n' > "$cnf"
+      msg_info "Creado override de MySQL: ${cnf}"
+    else
+      msg_error "No se encontró el archivo de configuración: ${cnf}"
+      return 1
+    fi
   fi
 
-  systemctl restart mariadb
-  msg_ok "bind-address configurado: ${ip_val}. MariaDB reiniciado."
+  if [[ "$ip_val" == "0.0.0.0" ]]; then
+    msg_warn "Exponer $(db_label) en todas las interfaces requiere UFW y usuarios con host restringido."
+    prompt_yes_no "¿Confirmar exposición en 0.0.0.0?" "n"
+    [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado."; return 0; }
+  fi
+
+  cp "$cnf" "${cnf}.bak.$(date +%F-%H%M%S)"
+  if grep -q '^[#[:space:]]*bind-address' "$cnf"; then
+    sed -i "s/^[#[:space:]]*bind-address.*/bind-address = ${ip_val}/" "$cnf"
+  else
+    echo "bind-address = ${ip_val}" >> "$cnf"
+  fi
+
+  systemctl restart "$service"
+  msg_ok "bind-address configurado: ${ip_val}. $(db_label) reiniciado."
 }
 
 create_database_only() {
   require_mariadb || return 1
   msg_section "Crear base de datos"
   local db_name
-  read -rp "  Nombre de la base de datos: " db_name
-  [[ -z "$db_name" ]] && { msg_error "Nombre obligatorio."; return 1; }
-  mariadb <<SQL
+  prompt_db_name; db_name="$REPLY_DB_NAME"
+  if ! mariadb <<SQL
 CREATE DATABASE IF NOT EXISTS \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 SQL
+  then
+    msg_error "No se pudo crear la base de datos."
+    return 1
+  fi
   msg_ok "Base de datos lista: ${db_name}"
 }
 
 create_user_and_grant() {
   require_mariadb || return 1
   msg_section "Crear base de datos + usuario"
-  local db_name db_user
+  local db_name db_user db_password
 
-  read -rp "  Nombre de la base de datos: " db_name
-  read -rp "  Usuario MariaDB: " db_user
-  prompt_password_generic "Clave MariaDB"
+  prompt_db_name; db_name="$REPLY_DB_NAME"
+  prompt_db_user; db_user="$REPLY_DB_USER"
+  prompt_password_generic "Clave $(db_label)"
+  db_password="$(db_sql_escape "$DB_PASS_VALUE")"
   prompt_host_scope || return 1
 
-  mariadb <<SQL
+  if ! mariadb <<SQL
 CREATE DATABASE IF NOT EXISTS \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER IF NOT EXISTS '${db_user}'@'${REPLY_HOST}' IDENTIFIED BY '${DB_PASS_VALUE}';
-ALTER USER '${db_user}'@'${REPLY_HOST}' IDENTIFIED BY '${DB_PASS_VALUE}';
+CREATE USER IF NOT EXISTS '${db_user}'@'${REPLY_HOST}' IDENTIFIED BY '${db_password}';
+ALTER USER '${db_user}'@'${REPLY_HOST}' IDENTIFIED BY '${db_password}';
 GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'${REPLY_HOST}';
 FLUSH PRIVILEGES;
 SQL
+  then
+    DB_PASS_VALUE=""; db_password=""
+    msg_error "No se pudo crear o actualizar la base y el usuario."
+    return 1
+  fi
+  DB_PASS_VALUE=""; db_password=""
 
   echo
   msg_ok "Base y usuario creados/actualizados."
@@ -1363,19 +1556,26 @@ SQL
 create_user_only() {
   require_mariadb || return 1
   msg_section "Crear usuario y asignarlo a una base"
-  local db_name db_user
+  local db_name db_user db_password
 
-  read -rp "  Base de datos a asignar: " db_name
-  read -rp "  Usuario MariaDB: " db_user
-  prompt_password_generic "Clave MariaDB"
+  prompt_db_name; db_name="$REPLY_DB_NAME"
+  prompt_db_user; db_user="$REPLY_DB_USER"
+  prompt_password_generic "Clave $(db_label)"
+  db_password="$(db_sql_escape "$DB_PASS_VALUE")"
   prompt_host_scope || return 1
 
-  mariadb <<SQL
-CREATE USER IF NOT EXISTS '${db_user}'@'${REPLY_HOST}' IDENTIFIED BY '${DB_PASS_VALUE}';
-ALTER USER '${db_user}'@'${REPLY_HOST}' IDENTIFIED BY '${DB_PASS_VALUE}';
+  if ! mariadb <<SQL
+CREATE USER IF NOT EXISTS '${db_user}'@'${REPLY_HOST}' IDENTIFIED BY '${db_password}';
+ALTER USER '${db_user}'@'${REPLY_HOST}' IDENTIFIED BY '${db_password}';
 GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'${REPLY_HOST}';
 FLUSH PRIVILEGES;
 SQL
+  then
+    DB_PASS_VALUE=""; db_password=""
+    msg_error "No se pudo crear o actualizar el usuario."
+    return 1
+  fi
+  DB_PASS_VALUE=""; db_password=""
 
   echo
   msg_ok "Usuario creado/actualizado."
@@ -1387,23 +1587,31 @@ SQL
 create_dual_user() {
   require_mariadb || return 1
   msg_section "Crear usuario dual (localhost + remoto)"
-  local db_name db_user remote_host
+  local db_name db_user remote_host db_password
 
-  read -rp "  Nombre de la base de datos: " db_name
-  read -rp "  Usuario MariaDB: " db_user
-  prompt_password_generic "Clave MariaDB"
+  prompt_db_name; db_name="$REPLY_DB_NAME"
+  prompt_db_user; db_user="$REPLY_DB_USER"
+  prompt_password_generic "Clave $(db_label)"
+  db_password="$(db_sql_escape "$DB_PASS_VALUE")"
   read -rp "  IP o red remota autorizada (ej: 192.168.11.% o 100.64.0.10): " remote_host
+  valid_db_host "$remote_host" || { msg_error "Host o red inválida."; return 1; }
 
-  mariadb <<SQL
+  if ! mariadb <<SQL
 CREATE DATABASE IF NOT EXISTS \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER IF NOT EXISTS '${db_user}'@'localhost'       IDENTIFIED BY '${DB_PASS_VALUE}';
-ALTER  USER              '${db_user}'@'localhost'       IDENTIFIED BY '${DB_PASS_VALUE}';
+CREATE USER IF NOT EXISTS '${db_user}'@'localhost'       IDENTIFIED BY '${db_password}';
+ALTER  USER              '${db_user}'@'localhost'       IDENTIFIED BY '${db_password}';
 GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'localhost';
-CREATE USER IF NOT EXISTS '${db_user}'@'${remote_host}' IDENTIFIED BY '${DB_PASS_VALUE}';
-ALTER  USER              '${db_user}'@'${remote_host}' IDENTIFIED BY '${DB_PASS_VALUE}';
+CREATE USER IF NOT EXISTS '${db_user}'@'${remote_host}' IDENTIFIED BY '${db_password}';
+ALTER  USER              '${db_user}'@'${remote_host}' IDENTIFIED BY '${db_password}';
 GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'${remote_host}';
 FLUSH PRIVILEGES;
 SQL
+  then
+    DB_PASS_VALUE=""; db_password=""
+    msg_error "No se pudo crear el usuario dual."
+    return 1
+  fi
+  DB_PASS_VALUE=""; db_password=""
 
   echo
   msg_ok "Usuario dual creado/actualizado."
@@ -1439,14 +1647,22 @@ show_grants_for_user() {
 change_user_password() {
   require_mariadb || return 1
   msg_section "Cambiar contraseña de usuario"
+  local db_password
   _select_app_user "Selecciona el usuario al que cambiar la contraseña:" || return 0
   echo
   msg_info "Cambiando contraseña de '${SELECTED_DB_USER}'@'${SELECTED_DB_HOST}'"
   prompt_password_generic "Nueva contraseña"
-  mariadb <<SQL
-ALTER USER '${SELECTED_DB_USER}'@'${SELECTED_DB_HOST}' IDENTIFIED BY '${DB_PASS_VALUE}';
+  db_password="$(db_sql_escape "$DB_PASS_VALUE")"
+  if ! mariadb <<SQL
+ALTER USER '${SELECTED_DB_USER}'@'${SELECTED_DB_HOST}' IDENTIFIED BY '${db_password}';
 FLUSH PRIVILEGES;
 SQL
+  then
+    DB_PASS_VALUE=""; db_password=""
+    msg_error "No se pudo actualizar la contraseña."
+    return 1
+  fi
+  DB_PASS_VALUE=""; db_password=""
   msg_ok "Contraseña actualizada: '${SELECTED_DB_USER}'@'${SELECTED_DB_HOST}'"
 }
 
@@ -1455,9 +1671,13 @@ delete_database() {
   msg_section "Eliminar base de datos"
   local db_name confirm
   read -rp "  Base de datos a eliminar: " db_name
+  valid_db_name "$db_name" || { msg_error "Nombre de base de datos inválido."; return 1; }
   prompt_yes_no "¿Confirmar eliminación de '${db_name}'?" "n"; confirm="$REPLY_YESNO"
   [[ "$confirm" != "s" ]] && { msg_warn "Cancelado."; return 0; }
-  mariadb -e "DROP DATABASE IF EXISTS \`${db_name}\`;"
+  if ! mariadb -e "DROP DATABASE IF EXISTS \`${db_name}\`;"; then
+    msg_error "No se pudo eliminar la base de datos."
+    return 1
+  fi
   msg_ok "Base eliminada: ${db_name}"
 }
 
@@ -1467,14 +1687,19 @@ delete_user() {
   local db_user db_host confirm
   read -rp "  Usuario MariaDB a eliminar: " db_user
   read -rp "  Host del usuario (ej: localhost, %): " db_host
+  valid_db_user "$db_user" || { msg_error "Usuario inválido."; return 1; }
+  valid_db_host "$db_host" || { msg_error "Host inválido."; return 1; }
   prompt_yes_no "¿Confirmar eliminación de '${db_user}'@'${db_host}'?" "n"; confirm="$REPLY_YESNO"
   [[ "$confirm" != "s" ]] && { msg_warn "Cancelado."; return 0; }
-  mariadb -e "DROP USER IF EXISTS '${db_user}'@'${db_host}'; FLUSH PRIVILEGES;"
+  if ! mariadb -e "DROP USER IF EXISTS '${db_user}'@'${db_host}'; FLUSH PRIVILEGES;"; then
+    msg_error "No se pudo eliminar el usuario."
+    return 1
+  fi
   msg_ok "Usuario eliminado: ${db_user}@${db_host}"
 }
 
 mariadb_secure_hint() {
-  msg_section "Endurecer MariaDB"
+  msg_section "Endurecer $(db_label)"
   msg_info "Para endurecer MariaDB ejecuta manualmente:"
   echo "    mysql_secure_installation"
   msg_warn "Recomendado si este LXC no es solo de laboratorio."
@@ -1504,11 +1729,12 @@ change_user_host() {
   prompt_yes_no "¿Cambiar host de '${db_user}@${old_host}' → '${db_user}@${new_host}'?" "s"
   [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado."; return 0; }
 
-  mariadb <<SQL
-UPDATE mysql.user SET Host='${new_host}' WHERE User='${db_user}' AND Host='${old_host}';
-UPDATE mysql.db   SET Host='${new_host}' WHERE User='${db_user}' AND Host='${old_host}';
-FLUSH PRIVILEGES;
-SQL
+  # RENAME USER conserva los privilegios y funciona tanto en MariaDB como MySQL 8.
+  # No se modifican tablas internas, que en MySQL 8 no deben actualizarse directamente.
+  if ! mariadb -e "RENAME USER '${db_user}'@'${old_host}' TO '${db_user}'@'${new_host}';"; then
+    msg_error "No se pudo cambiar el host del usuario."
+    return 1
+  fi
 
   msg_ok "Host cambiado: ${db_user}@${old_host}  →  ${db_user}@${new_host}"
   echo
@@ -1536,6 +1762,7 @@ change_user_grants() {
   if [[ -z "$db_name" ]]; then
     grant_target="*.*"
   else
+    valid_db_name "$db_name" || { msg_error "Nombre de base de datos inválido."; return 1; }
     grant_target="\`${db_name}\`.*"
   fi
 
@@ -1562,11 +1789,15 @@ change_user_grants() {
   prompt_yes_no "¿Aplicar REVOKE ALL + GRANT ${priv} ON ${grant_target} a '${db_user}'@'${db_host}'?" "s"
   [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado."; return 0; }
 
-  mariadb <<SQL
+  if ! mariadb <<SQL
 REVOKE ALL PRIVILEGES, GRANT OPTION FROM '${db_user}'@'${db_host}';
 GRANT ${priv} ON ${grant_target} TO '${db_user}'@'${db_host}';
 FLUSH PRIVILEGES;
 SQL
+  then
+    msg_error "No se pudieron actualizar los privilegios."
+    return 1
+  fi
 
   msg_ok "Privilegios actualizados."
   echo
@@ -1586,11 +1817,13 @@ dump_database() {
 
   local db_name
   read -rp "  Nombre de la base de datos: " db_name
-  [[ -z "$db_name" ]] && { msg_error "Nombre obligatorio."; return 1; }
+  valid_db_name "$db_name" || { msg_error "Nombre de base de datos inválido."; return 1; }
 
-  local dump_dir="/var/backups/mariadb"
+  local dump_dir
+  dump_dir="$(db_backup_dir)"
   mkdir -p "$dump_dir"
-  local dump_file="${dump_dir}/${db_name}_$(date +%F_%H%M%S).sql.gz"
+  local dump_file
+  dump_file="${dump_dir}/${db_name}_$(date +%F_%H%M%S).sql.gz"
 
   msg_info "Volcando ${db_name} → ${dump_file}..."
   if mysqldump --single-transaction --quick --lock-tables=false "$db_name" \
@@ -1611,7 +1844,8 @@ restore_database() {
   require_mariadb || return 1
   msg_section "Restaurar base de datos desde backup"
 
-  local dump_dir="/var/backups/mariadb"
+  local dump_dir
+  dump_dir="$(db_backup_dir)"
   local files=()
   if [[ -d "$dump_dir" ]]; then
     mapfile -t files < <(
@@ -1652,7 +1886,7 @@ restore_database() {
 
   local db_name
   read -rp "  Base de datos destino (debe existir): " db_name
-  [[ -z "$db_name" ]] && { msg_error "Nombre obligatorio."; return 1; }
+  valid_db_name "$db_name" || { msg_error "Nombre de base de datos inválido."; return 1; }
 
   prompt_yes_no "¿Restaurar '$(basename "$source_file")' en '${db_name}'? (se sobreescribirán los datos actuales)" "n"
   [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado."; return 0; }
@@ -1691,6 +1925,84 @@ show_active_connections() {
   echo
   local total; total="$(mariadb -sNe "SELECT COUNT(*) FROM information_schema.processlist;" 2>/dev/null || echo '?')"
   msg_info "Total de conexiones activas: ${total}"
+}
+
+db_health_check() {
+  require_mariadb || return 1
+  msg_section "Diagnóstico de $(db_label)"
+
+  local engine service cnf version port socket uptime connections max_connections
+  engine="$(db_engine)"
+  service="$(db_service)"
+  cnf="$(db_config_file)"
+  version="$(mariadb -sNe 'SELECT VERSION();' 2>/dev/null || echo 'no disponible')"
+  port="$(mariadb -sNe "SHOW VARIABLES LIKE 'port';" 2>/dev/null | awk '{print $2}' || echo '3306')"
+  socket="$(mariadb -sNe "SHOW VARIABLES LIKE 'socket';" 2>/dev/null | awk '{print $2}' || echo '—')"
+  uptime="$(mariadb -sNe "SHOW GLOBAL STATUS LIKE 'Uptime';" 2>/dev/null | awk '{print $2}' || echo '?')"
+  connections="$(mariadb -sNe "SHOW GLOBAL STATUS LIKE 'Threads_connected';" 2>/dev/null | awk '{print $2}' || echo '?')"
+  max_connections="$(mariadb -sNe "SHOW VARIABLES LIKE 'max_connections';" 2>/dev/null | awk '{print $2}' || echo '?')"
+
+  printf "  %-24s %s\n" "Motor:" "$(db_label) (${engine})"
+  printf "  %-24s %s\n" "Versión:" "$version"
+  printf "  %-24s %s\n" "Servicio:" "$service"
+  printf "  %-24s %s\n" "Puerto:" "$port"
+  printf "  %-24s %s\n" "Socket:" "$socket"
+  printf "  %-24s %s\n" "Configuración:" "$cnf"
+  printf "  %-24s %s\n" "Conexiones actuales:" "${connections} / ${max_connections}"
+  if [[ "$uptime" =~ ^[0-9]+$ ]]; then
+    printf "  %-24s %s días, %s horas\n" "Uptime:" "$((uptime / 86400))" "$(((uptime % 86400) / 3600))"
+  else
+    printf "  %-24s %s\n" "Uptime:" "$uptime"
+  fi
+  echo
+
+  if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ":${port}$"; then
+    msg_ok "El puerto ${port} está en escucha."
+  else
+    msg_warn "No se detectó escucha TCP en el puerto ${port}; puede estar limitado al socket local."
+  fi
+  mariadb -e 'SELECT 1 AS conexion_ok;' >/dev/null 2>&1 \
+    && msg_ok "Consulta de prueba completada." \
+    || msg_error "No se pudo ejecutar la consulta de prueba."
+}
+
+dump_all_databases() {
+  require_mariadb || return 1
+  msg_section "Backup completo de $(db_label)"
+
+  local dump_dir dump_file retention
+  dump_dir="$(db_backup_dir)"
+  install -d -m 0700 "$dump_dir"
+  dump_file="${dump_dir}/all_databases_$(date +%F_%H%M%S).sql.gz"
+
+  msg_info "Incluye bases de sistema, usuarios, grants, triggers, eventos y rutinas."
+  prompt_yes_no "¿Crear backup completo ahora?" "s"
+  [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado."; return 0; }
+
+  if db_dump --single-transaction --quick --routines --events --triggers --all-databases \
+      | gzip -c > "$dump_file"; then
+    chmod 600 "$dump_file"
+    msg_ok "Backup completo creado: ${dump_file} ($(du -h "$dump_file" | cut -f1))"
+  else
+    rm -f "$dump_file"
+    msg_error "Falló el backup completo."
+    return 1
+  fi
+
+  echo
+  read -rp "  Días de retención para backups completos [30] (0 = no limpiar): " retention
+  retention="${retention:-30}"
+  if [[ "$retention" =~ ^[0-9]+$ ]] && (( retention > 0 )); then
+    local old_count
+    old_count="$(find "$dump_dir" -maxdepth 1 -type f -name 'all_databases_*.sql.gz' -mtime +"$retention" -print | wc -l | tr -d ' ')"
+    if (( old_count > 0 )); then
+      prompt_yes_no "¿Eliminar ${old_count} backup(s) completo(s) de más de ${retention} días?" "n"
+      [[ "$REPLY_YESNO" == "s" ]] && find "$dump_dir" -maxdepth 1 -type f -name 'all_databases_*.sql.gz' -mtime +"$retention" -delete \
+        && msg_ok "Retención aplicada."
+    fi
+  elif [[ "$retention" != "0" ]]; then
+    msg_warn "Retención ignorada: usa un número entero de días."
+  fi
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2664,8 +2976,12 @@ sec_install_ufw() {
   if mariadb_installed; then
     prompt_yes_no "¿Permitir acceso remoto a MariaDB (puerto 3306) desde una red/IP?" "n"
     if [[ "$REPLY_YESNO" == "s" ]]; then
-      read -rp "  Red o IP origen (ej: 192.168.11.0/24): " mdb_src
-      [[ -n "$mdb_src" ]] && mdb_rule="s"
+      while true; do
+        read -rp "  Red o IP origen (ej: 192.168.11.0/24; 0 = cancelar): " mdb_src
+        [[ "$mdb_src" == "0" ]] && break
+        if valid_ipv4_or_cidr "$mdb_src"; then mdb_rule="s"; break; fi
+        msg_error "IPv4 o CIDR inválido."
+      done
     fi
   fi
 
@@ -2696,6 +3012,14 @@ sec_install_ufw() {
 
 sec_install_fail2ban() {
   msg_section "Fail2ban — bloqueo de ataques por fuerza bruta"
+
+  if systemctl is-active --quiet crowdsec 2>/dev/null; then
+    msg_warn "CrowdSec está activo. Ejecutar ambos motores duplica bloqueos y dificulta el diagnóstico."
+    prompt_yes_no "¿Deshabilitar CrowdSec y usar Fail2ban?" "n"
+    [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Instalación cancelada; CrowdSec permanece activo."; return 0; }
+    systemctl disable --now crowdsec >/dev/null 2>&1 || true
+    systemctl disable --now crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+  fi
 
   if ! dpkg -s fail2ban >/dev/null 2>&1; then
     msg_info "Instalando fail2ban..."
@@ -2751,6 +3075,132 @@ EOF
   echo "      fail2ban-client set sshd unbanip <IP>  # desbanear"
 }
 
+crowdsec_installed() { command -v cscli >/dev/null 2>&1; }
+crowdsec_running()   { systemctl is-active --quiet crowdsec 2>/dev/null; }
+
+crowdsec_bouncer_running() {
+  systemctl is-active --quiet crowdsec-firewall-bouncer 2>/dev/null
+}
+
+sec_install_crowdsec() {
+  msg_section "CrowdSec — detección colaborativa y bloqueo en firewall"
+
+  if systemctl is-active --quiet fail2ban 2>/dev/null; then
+    msg_warn "Fail2ban está activo. Se recomienda usar un solo motor de decisiones por VPS."
+    prompt_yes_no "¿Deshabilitar Fail2ban y usar CrowdSec?" "n"
+    [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Instalación cancelada; Fail2ban permanece activo."; return 0; }
+    systemctl disable --now fail2ban >/dev/null 2>&1 || true
+  fi
+
+  echo
+  msg_info "Se instalarán el motor CrowdSec, las colecciones Linux/Nginx y el bouncer de firewall."
+  msg_info "Los logs permanecen locales; CrowdSec comparte señales de ataque, no el contenido completo del log."
+  prompt_yes_no "¿Continuar con la instalación oficial de CrowdSec?" "s"
+  [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado."; return 0; }
+
+  apt-get install -y ca-certificates curl gnupg
+  install -d -m 0755 /etc/apt/keyrings /etc/apt/sources.list.d
+
+  local key_tmp
+  key_tmp="$(mktemp)"
+  if ! curl --fail --silent --show-error --location \
+      https://packagecloud.io/crowdsec/crowdsec/gpgkey --output "$key_tmp"; then
+    rm -f "$key_tmp"
+    msg_error "No se pudo descargar la clave oficial de CrowdSec."
+    return 1
+  fi
+  if ! gpg --batch --yes --dearmor --output "$CROWDSEC_KEYRING" "$key_tmp"; then
+    rm -f "$key_tmp"
+    msg_error "No se pudo validar/convertir la clave del repositorio CrowdSec."
+    return 1
+  fi
+  rm -f "$key_tmp"
+  chmod 0644 "$CROWDSEC_KEYRING"
+
+  cat > "$CROWDSEC_SOURCE" <<EOF
+deb [signed-by=${CROWDSEC_KEYRING}] https://packagecloud.io/crowdsec/crowdsec/any any main
+EOF
+  chmod 0644 "$CROWDSEC_SOURCE"
+  apt-get update
+
+  local bouncer_pkg="crowdsec-firewall-bouncer-iptables"
+  if iptables -V 2>/dev/null | grep -q 'nf_tables' \
+     || { ! command -v iptables >/dev/null 2>&1 && command -v nft >/dev/null 2>&1; }; then
+    bouncer_pkg="crowdsec-firewall-bouncer-nftables"
+  fi
+  msg_info "Backend detectado: ${bouncer_pkg}"
+  apt-get install -y crowdsec "$bouncer_pkg"
+
+  cscli hub update >/dev/null 2>&1 || true
+  cscli collections install crowdsecurity/linux
+  cscli collections install crowdsecurity/nginx
+
+  install -d -m 0755 /etc/crowdsec/acquis.d
+  cat > "$CROWDSEC_ACQUIS" <<'EOF'
+filenames:
+  - /var/log/nginx/*.log
+labels:
+  type: nginx
+EOF
+  chmod 0644 "$CROWDSEC_ACQUIS"
+
+  systemctl enable --now crowdsec
+  systemctl restart crowdsec
+  systemctl enable --now crowdsec-firewall-bouncer
+  systemctl restart crowdsec-firewall-bouncer
+
+  if ! crowdsec_running || ! crowdsec_bouncer_running; then
+    msg_error "CrowdSec o su bouncer no quedaron activos. Revisa journalctl -u crowdsec."
+    return 1
+  fi
+
+  echo
+  msg_ok "CrowdSec activo con colecciones Linux/Nginx y bloqueo en firewall."
+  msg_info "Las decisiones pueden tardar unos minutos en aparecer si aún no hay ataques."
+  sec_crowdsec_status
+}
+
+sec_crowdsec_status() {
+  msg_section "Estado de CrowdSec"
+  if ! crowdsec_installed; then
+    msg_warn "CrowdSec no está instalado."
+    return 0
+  fi
+
+  crowdsec_running \
+    && msg_ok "Motor crowdsec: activo" \
+    || msg_error "Motor crowdsec: inactivo"
+  crowdsec_bouncer_running \
+    && msg_ok "Firewall bouncer: activo" \
+    || msg_error "Firewall bouncer: inactivo"
+  echo
+  msg_info "Bouncers registrados:"
+  cscli bouncers list 2>/dev/null | sed 's/^/    /' || true
+  echo
+  msg_info "Decisiones activas:"
+  cscli decisions list 2>/dev/null | sed 's/^/    /' || true
+  echo
+  msg_info "Métricas de adquisición y parsers:"
+  cscli metrics 2>/dev/null | sed 's/^/    /' || true
+}
+
+sec_select_intrusion_engine() {
+  msg_section "Protección anti-intrusión"
+  echo "  1) CrowdSec  (recomendado: inteligencia colaborativa + firewall bouncer)"
+  echo "  2) Fail2ban  (alternativa clásica y completamente local)"
+  echo "  0) Omitir"
+  echo
+  local opt
+  read -rp "  Opción [1]: " opt
+  opt="${opt:-1}"
+  case "$opt" in
+    1) sec_install_crowdsec ;;
+    2) sec_install_fail2ban ;;
+    0) msg_warn "Protección anti-intrusión omitida." ;;
+    *) msg_error "Opción inválida."; return 1 ;;
+  esac
+}
+
 sec_harden_ssh() {
   msg_section "Endurecer SSH"
 
@@ -2777,7 +3227,9 @@ sec_harden_ssh() {
   prompt_yes_no "¿Deshabilitar TAMBIÉN la autenticación por contraseña para TODOS los usuarios?" "n"
   local no_passwords="$REPLY_YESNO"
 
-  cp "$sshd" "${sshd}.bak.$(date +%F-%H%M%S)"
+  local sshd_backup
+  sshd_backup="${sshd}.bak.$(date +%F-%H%M%S)"
+  cp "$sshd" "$sshd_backup"
 
   _sshd_set() {
     local key="$1" val="$2"
@@ -2804,7 +3256,7 @@ sec_harden_ssh() {
       && msg_warn "Autenticación por contraseña DESHABILITADA. Solo claves SSH."
   else
     msg_error "sshd_config inválido. Restaurando backup..."
-    cp "${sshd}.bak."* "$sshd" 2>/dev/null || true
+    cp "$sshd_backup" "$sshd"
     return 1
   fi
   echo
@@ -3177,6 +3629,11 @@ sec_nginx_headers() {
   msg_section "Headers de seguridad Nginx"
 
   install -d -m 0755 /etc/nginx/snippets
+  local rollback_dir
+  rollback_dir="$(mktemp -d)"
+  [[ -f "$NGINX_SEC_SNIPPET" ]] && cp -a "$NGINX_SEC_SNIPPET" "${rollback_dir}/security-headers.conf"
+  [[ -f /etc/nginx/conf.d/security.conf ]] \
+    && cp -a /etc/nginx/conf.d/security.conf "${rollback_dir}/nginx-security.conf"
 
   cat > "$NGINX_SEC_SNIPPET" <<'EOF'
 # Generado por DevLab Manager — headers de seguridad
@@ -3184,7 +3641,6 @@ add_header X-Frame-Options        "SAMEORIGIN"                          always;
 add_header X-Content-Type-Options "nosniff"                             always;
 add_header Referrer-Policy        "strict-origin-when-cross-origin"     always;
 add_header Permissions-Policy     "camera=(), microphone=(), geolocation=()" always;
-add_header X-XSS-Protection       "1; mode=block"                       always;
 EOF
   msg_ok "Snippet creado: ${NGINX_SEC_SNIPPET}"
 
@@ -3208,6 +3664,7 @@ EOF
   for site in "${sites[@]}"; do
     local conf="/etc/nginx/sites-available/${site}"
     if ! grep -q "security-headers.conf" "$conf"; then
+      cp -a "$conf" "${rollback_dir}/site-${site}"
       sed -i "/server_name /a\\    include snippets/security-headers.conf;" "$conf"
       msg_ok "Headers agregados a: ${site}"
       ((patched++)) || true
@@ -3216,11 +3673,27 @@ EOF
     fi
   done
 
-  if nginx -t >/dev/null 2>&1; then
-    systemctl reload nginx
+  if nginx -t >/dev/null 2>&1 && systemctl reload nginx; then
+    rm -rf "$rollback_dir"
     msg_ok "Nginx recargado. Sitios actualizados: ${patched}."
   else
-    msg_error "nginx -t falló. Revisa la configuración."
+    local site_backup
+    for site_backup in "${rollback_dir}"/site-*; do
+      [[ -f "$site_backup" ]] || continue
+      cp -a "$site_backup" "/etc/nginx/sites-available/${site_backup##*/site-}"
+    done
+    if [[ -f "${rollback_dir}/security-headers.conf" ]]; then
+      cp -a "${rollback_dir}/security-headers.conf" "$NGINX_SEC_SNIPPET"
+    else
+      rm -f "$NGINX_SEC_SNIPPET"
+    fi
+    if [[ -f "${rollback_dir}/nginx-security.conf" ]]; then
+      cp -a "${rollback_dir}/nginx-security.conf" /etc/nginx/conf.d/security.conf
+    else
+      rm -f /etc/nginx/conf.d/security.conf
+    fi
+    rm -rf "$rollback_dir"
+    msg_error "La validación o recarga de Nginx falló. Se restauraron las configuraciones anteriores."
     return 1
   fi
   echo
@@ -3271,16 +3744,26 @@ sec_audit() {
   else
     _chk "UFW firewall" warn "inactivo o no instalado (Seguridad → 7)"
   fi
-  if dpkg -s fail2ban >/dev/null 2>&1 && systemctl is-active --quiet fail2ban; then
-    _chk "fail2ban" ok "activo"
+  local crowdsec_active="n" fail2ban_active="n"
+  crowdsec_running && crowdsec_active="s"
+  systemctl is-active --quiet fail2ban 2>/dev/null && fail2ban_active="s"
+  if [[ "$crowdsec_active" == "s" && "$fail2ban_active" == "s" ]]; then
+    _chk "Motor anti-intrusión" warn "CrowdSec y Fail2ban activos a la vez; selecciona solo uno (Seguridad → 8)"
+  elif [[ "$crowdsec_active" == "s" ]]; then
+    _chk "CrowdSec" ok "motor activo"
+    crowdsec_bouncer_running \
+      && _chk "CrowdSec firewall bouncer" ok "activo" \
+      || _chk "CrowdSec firewall bouncer" warn "inactivo; no se aplicarán bloqueos"
+  elif [[ "$fail2ban_active" == "s" ]]; then
+    _chk "Fail2ban" ok "activo"
   else
-    _chk "fail2ban" warn "inactivo o no instalado (Seguridad → 8)"
+    _chk "Motor anti-intrusión" warn "CrowdSec/Fail2ban inactivo o no instalado (Seguridad → 8)"
   fi
 
   echo; echo -e "  ${BOLD}── SSH ──${RESET}"
   local prl pauth
-  prl="$(awk '/^PermitRootLogin/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)"
-  pauth="$(awk '/^PasswordAuthentication/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)"
+  prl="$(sshd -T 2>/dev/null | awk '$1=="permitrootlogin" {print $2; exit}')"
+  pauth="$(sshd -T 2>/dev/null | awk '$1=="passwordauthentication" {print $2; exit}')"
   case "$prl" in
     no|prohibit-password) _chk "PermitRootLogin" ok "$prl" ;;
     yes)                  _chk "PermitRootLogin" warn "yes — root con contraseña (Seguridad → 2)" ;;
@@ -3307,7 +3790,7 @@ sec_audit() {
   echo; echo -e "  ${BOLD}── Nginx ──${RESET}"
   [[ -f "$NGINX_SEC_SNIPPET" ]] \
     && _chk "Headers de seguridad" ok "snippet instalado" \
-    || _chk "Headers de seguridad" warn "sin configurar (Seguridad → 9)"
+    || _chk "Headers de seguridad" warn "sin configurar (Seguridad → 10)"
   grep -rq "server_tokens off" /etc/nginx/ 2>/dev/null \
     && _chk "server_tokens" ok "off (versión oculta)" \
     || _chk "server_tokens" warn "versión de Nginx expuesta"
@@ -3330,10 +3813,26 @@ sec_audit() {
   done < <(find /var/www -maxdepth 2 -name ".env" 2>/dev/null)
   [[ $bad_env -eq 0 ]] && _chk "Permisos .env" ok "correctos (640/600)"
 
-  echo; echo -e "  ${BOLD}── MariaDB ──${RESET}"
+  local bad_owner=0
+  while IFS= read -r dir; do
+    _chk "Propietario del código" warn "${dir} pertenece a www-data; reparar permisos"
+    bad_owner=1
+  done < <(find /var/www -mindepth 1 -maxdepth 1 -type d -user www-data 2>/dev/null)
+  [[ $bad_owner -eq 0 ]] && _chk "Propietario del código" ok "raíces de sitio no pertenecen a www-data"
+
+  local upload_php=0
+  while IFS= read -r f; do
+    _chk "PHP dentro de uploads" warn "$f"
+    upload_php=1
+  done < <(find /var/www -type f -path '*/public/uploads/*' \
+            \( -iname '*.php' -o -iname '*.phtml' -o -iname '*.phar' \) 2>/dev/null)
+  [[ $upload_php -eq 0 ]] && _chk "PHP dentro de uploads" ok "ningún ejecutable detectado"
+
+  echo; echo -e "  ${BOLD}── $(db_label) ──${RESET}"
   if mariadb_installed; then
-    local bind
-    bind="$(awk -F'=' '/^bind-address/ {gsub(/ /,"",$2); print $2; exit}' "$MARIADB_CNF" 2>/dev/null)"
+    local bind db_cnf
+    db_cnf="$(db_config_file)"
+    bind="$(awk -F'=' '/^bind-address/ {gsub(/ /,"",$2); print $2; exit}' "$db_cnf" 2>/dev/null)"
     case "$bind" in
       127.0.0.1) _chk "bind-address" ok "127.0.0.1 (solo local)" ;;
       0.0.0.0)   _chk "bind-address" warn "0.0.0.0 — expuesto a todas las interfaces" ;;
@@ -3350,13 +3849,13 @@ sec_audit() {
       && _chk "Usuarios con host %" ok "ninguno" \
       || _chk "Usuarios con host %" warn "${wide} usuario(s) aceptan conexión desde cualquier IP"
   else
-    _chk "MariaDB" ok "no instalado en este LXC"
+    _chk "MySQL / MariaDB" ok "no instalado en este LXC"
   fi
 
   echo; echo -e "  ${BOLD}── Sistema ──${RESET}"
   dpkg -s unattended-upgrades >/dev/null 2>&1 \
     && _chk "Actualizaciones automáticas" ok "habilitadas" \
-    || _chk "Actualizaciones automáticas" warn "sin configurar (Seguridad → 10)"
+    || _chk "Actualizaciones automáticas" warn "sin configurar (Seguridad → 11)"
   local pending
   pending="$(apt list --upgradable 2>/dev/null | grep -c "security" || true)"
   [[ "${pending:-0}" -eq 0 ]] \
@@ -3379,7 +3878,7 @@ sec_harden_all() {
   echo
   echo "    1. Diagnóstico de puerto SSH (socket activation / Include)"
   echo "    2. Firewall UFW"
-  echo "    3. fail2ban"
+  echo "    3. CrowdSec o Fail2ban (seleccionable)"
   echo "    4. Endurecer SSH"
   echo "    5. Headers de seguridad Nginx"
   echo "    6. Actualizaciones de seguridad automáticas"
@@ -3390,7 +3889,7 @@ sec_harden_all() {
 
   echo; sec_ssh_diagnose      || true
   echo; sec_install_ufw       || true
-  echo; sec_install_fail2ban  || true
+  echo; sec_select_intrusion_engine || true
   echo; sec_harden_ssh        || true
   echo; sec_nginx_headers     || true
   echo; sec_auto_updates      || true
@@ -3409,7 +3908,7 @@ menu_seguridad() {
     clear
     header_seguridad; echo
     menu_cat "Acción rápida" "$RED"
-    echo -e "  ${RED}1)${RESET} ${BOLD}Blindaje completo${RESET}  (firewall + fail2ban + SSH + Nginx + updates + auditoría)"
+    echo -e "  ${RED}1)${RESET} ${BOLD}Blindaje completo${RESET}  (firewall + CrowdSec/Fail2ban + SSH + Nginx + updates + auditoría)"
     menu_cat "Acceso SSH (prioridad alta)" "$RED"
     echo -e "  ${RED}2)${RESET} Endurecer SSH  (root sin password, límites de intentos)"
     echo -e "  ${RED}3)${RESET} Acceso por clave SSH desde tu Mac  (autorizar clave + guía)"
@@ -3418,12 +3917,13 @@ menu_seguridad() {
     echo -e "  ${RED}6)${RESET} Diagnosticar y reparar puerto SSH  (socket activation / Include)"
     menu_cat "Red y fuerza bruta" "$RED"
     echo -e "  ${RED}7)${RESET} Firewall UFW  (deny incoming + SSH/HTTP/HTTPS)"
-    echo -e "  ${RED}8)${RESET} fail2ban  (anti fuerza bruta: SSH + Nginx)"
+    echo -e "  ${RED}8)${RESET} Protección anti-intrusión  (CrowdSec recomendado / Fail2ban)"
+    echo -e "  ${RED}9)${RESET} Estado de CrowdSec  (bouncer, decisiones y métricas)"
     menu_cat "Web y sistema" "$RED"
-    echo -e "  ${RED}9)${RESET} Headers de seguridad Nginx  (+ ocultar versión)"
-    echo -e "  ${RED}10)${RESET} Actualizaciones de seguridad automáticas"
+    echo -e "  ${RED}10)${RESET} Headers de seguridad Nginx  (+ ocultar versión)"
+    echo -e "  ${RED}11)${RESET} Actualizaciones de seguridad automáticas"
     menu_cat "Verificación" "$RED"
-    echo -e "  ${RED}11)${RESET} Auditoría de seguridad  (chequeo completo del entorno)"
+    echo -e "  ${RED}12)${RESET} Auditoría de seguridad  (chequeo completo del entorno)"
     echo
     echo -e "  ${RED}0)${RESET} ← Volver al menú principal"
     echo
@@ -3436,10 +3936,11 @@ menu_seguridad() {
       5)  run_item header_seguridad sec_change_ssh_port ;;
       6)  run_item header_seguridad sec_ssh_diagnose ;;
       7)  run_item header_seguridad sec_install_ufw ;;
-      8)  run_item header_seguridad sec_install_fail2ban ;;
-      9)  run_item header_seguridad sec_nginx_headers ;;
-      10) run_item header_seguridad sec_auto_updates ;;
-      11) run_item header_seguridad sec_audit ;;
+      8)  run_item header_seguridad sec_select_intrusion_engine ;;
+      9)  run_item header_seguridad sec_crowdsec_status ;;
+      10) run_item header_seguridad sec_nginx_headers ;;
+      11) run_item header_seguridad sec_auto_updates ;;
+      12) run_item header_seguridad sec_audit ;;
       0)  return ;;
       *)  msg_error "Opción inválida."; pause ;;
     esac
@@ -3567,7 +4068,16 @@ _mon_render() {
   if mariadb_installed && mariadb_running; then
     ndb="$(mariadb -sNe 'SELECT COUNT(*) FROM information_schema.processlist' 2>/dev/null || echo '?')"
   fi
-  echo -e "  ${BOLD}Servicios${RESET}   Nginx $(_dot nginx)   PHP-FPM ${php_dot}   MariaDB $(_dot mariadb)   Cloudflared $(_dot cloudflared)   fail2ban $(_dot fail2ban)   UFW ${ufw_dot}"
+  local db_dot="${RED}●${RESET}" db_svc
+  db_svc="$(db_service)"
+  [[ -n "$db_svc" ]] && db_dot="$(_dot "$db_svc")"
+  local intrusion_dot intrusion_name
+  if crowdsec_running; then
+    intrusion_dot="$(_dot crowdsec)"; intrusion_name="CrowdSec"
+  else
+    intrusion_dot="$(_dot fail2ban)"; intrusion_name="Fail2ban"
+  fi
+  echo -e "  ${BOLD}Servicios${RESET}   Nginx $(_dot nginx)   PHP-FPM ${php_dot}   $(db_label) ${db_dot}   Cloudflared $(_dot cloudflared)   ${intrusion_name} ${intrusion_dot}   UFW ${ufw_dot}"
   echo -e "  ${DIM}Conexiones TCP: ${nconn}    Procesos PHP: ${nphp}    Conexiones DB: ${ndb}${RESET}"
   echo
 
@@ -3845,12 +4355,12 @@ dev_basic_auth() {
 
   local user
   read -rp "  Usuario: " user
-  [[ -z "$user" ]] && { msg_error "Usuario obligatorio."; return 1; }
+  valid_app_name "$user" || { msg_error "Usuario inválido. Usa letras, números, punto, guion o guion bajo."; return 1; }
 
   # Pide la contraseña dos veces y reintenta hasta que coincidan
   prompt_password_generic "Contraseña del sitio"
 
-  if ! htpasswd -cbB "$htfile" "$user" "$DB_PASS_VALUE" 2>/dev/null; then
+  if ! printf '%s\n' "$DB_PASS_VALUE" | htpasswd -ciB "$htfile" "$user" 2>/dev/null; then
     msg_error "htpasswd falló. No se aplicó ningún bloqueo al sitio."
     rm -f "$htfile" 2>/dev/null || true
     return 1
@@ -3972,7 +4482,7 @@ show_system_status() {
   else
     db_status="${YELLOW}no instalado${RESET}"
   fi
-  printf "  %-28s %b\n" "MariaDB:" "$db_status"
+  printf "  %-28s %b\n" "$(db_label):" "$db_status"
 
   local cf_status_s
   if cf_installed; then
@@ -3983,6 +4493,18 @@ show_system_status() {
     cf_status_s="${RED}no instalado${RESET}"
   fi
   printf "  %-28s %b\n" "cloudflared:" "$cf_status_s"
+
+  local intrusion_status
+  if crowdsec_running && crowdsec_bouncer_running; then
+    intrusion_status="${GREEN}CrowdSec + bouncer activos${RESET}"
+  elif systemctl is-active --quiet fail2ban 2>/dev/null; then
+    intrusion_status="${GREEN}Fail2ban activo${RESET}"
+  elif crowdsec_running; then
+    intrusion_status="${YELLOW}CrowdSec activo / bouncer inactivo${RESET}"
+  else
+    intrusion_status="${YELLOW}no activo${RESET}"
+  fi
+  printf "  %-28s %b\n" "Protección anti-intrusión:" "$intrusion_status"
 
   local ip; ip="$(detect_primary_ip 2>/dev/null || echo 'no detectada')"
   printf "  %-28s %s\n" "IP del LXC:" "$ip"
@@ -4010,8 +4532,12 @@ require_git() {
     apt-get install -y git
     msg_ok "Git instalado: $(git --version)"
   fi
-  # Evitar el error "dubious ownership" cuando root opera repos de www-data
-  git config --global --add safe.directory '*' 2>/dev/null || true
+}
+
+_git_allow_directory() {
+  local repo_dir="$1"
+  git config --global --get-all safe.directory 2>/dev/null | grep -Fxq "$repo_dir" \
+    || git config --global --add safe.directory "$repo_dir"
 }
 
 _is_git_repo() { [[ -d "${1}/.git" ]]; }
@@ -4061,11 +4587,15 @@ git_setup_key() {
   [[ -z "$email" ]] && email="deploy@$(hostname)"
 
   mkdir -p /root/.ssh
+  chmod 700 /root/.ssh
   ssh-keygen -t ed25519 -C "$email" -f "$GIT_DEPLOY_KEY" -N "" -q
   chmod 600 "$GIT_DEPLOY_KEY"
   chmod 644 "${GIT_DEPLOY_KEY}.pub"
 
   local ssh_cfg="/root/.ssh/config"
+  touch "$ssh_cfg"
+  # Corrige configuraciones antiguas creadas por versiones previas del script.
+  sed -i 's/StrictHostKeyChecking[[:space:]]\+no/StrictHostKeyChecking accept-new/g' "$ssh_cfg"
   if ! grep -q "Host github.com" "$ssh_cfg" 2>/dev/null; then
     cat >> "$ssh_cfg" <<EOF
 
@@ -4073,11 +4603,11 @@ Host github.com
     HostName github.com
     User git
     IdentityFile ${GIT_DEPLOY_KEY}
-    StrictHostKeyChecking no
+    StrictHostKeyChecking accept-new
 EOF
-    chmod 600 "$ssh_cfg"
-    msg_ok "~/.ssh/config configurado para GitHub."
+    msg_ok "/root/.ssh/config configurado para GitHub."
   fi
+  chmod 600 "$ssh_cfg"
 
   msg_ok "Clave generada: ${GIT_DEPLOY_KEY}"
   echo
@@ -4110,37 +4640,74 @@ git_clone_site() {
   local repo_url=""
   while true; do
     read -rp "  URL del repositorio: " repo_url
-    [[ -n "$repo_url" ]] && break
-    msg_error "La URL es obligatoria."
+    [[ -z "$repo_url" ]] && { msg_error "La URL es obligatoria."; continue; }
+    valid_git_repo_url "$repo_url" && break
+    msg_error "URL inválida. Solo se aceptan repositorios GitHub por SSH o HTTPS."
   done
 
   local branch="main"
   read -rp "  Rama a desplegar [main]: " branch
   branch="${branch:-main}"
-
-  if [[ -n "$(ls -A "$site_dir" 2>/dev/null)" ]]; then
-    msg_warn "${site_dir} no está vacío."
-    prompt_yes_no "¿Limpiar el directorio antes de clonar? (se perderán archivos actuales)" "n"
-    if [[ "$REPLY_YESNO" != "s" ]]; then
-      msg_error "Operación cancelada. Limpia el directorio manualmente o usa un sitio nuevo."; return 1
-    fi
-    rm -rf "${site_dir:?}"/*
-    rm -rf "${site_dir}"/.[!.]* 2>/dev/null || true
-    msg_warn "Directorio limpiado."
+  if ! valid_git_branch "$branch"; then
+    msg_error "Nombre de rama inválido."
+    return 1
   fi
 
-  msg_info "Clonando ${repo_url} (rama: ${branch}) en ${site_dir}..."
-  if git clone --branch "$branch" "$repo_url" "$site_dir" 2>&1; then
-    msg_ok "Repositorio clonado."
-  else
+  local preserve_existing="n"
+  if [[ -d "$site_dir" ]]; then
+    preserve_existing="s"
+  fi
+  if [[ -n "$(ls -A "$site_dir" 2>/dev/null)" ]]; then
+    msg_warn "${site_dir} no está vacío."
+    prompt_yes_no "¿Reemplazarlo conservando un backup completo?" "n"
+    if [[ "$REPLY_YESNO" != "s" ]]; then
+      msg_error "Operación cancelada. Usa un sitio nuevo o confirma el backup."; return 1
+    fi
+  fi
+
+  local clone_dir="${site_dir}.clone.$$"
+  msg_info "Clonando ${repo_url} (rama: ${branch}) en un directorio temporal..."
+  if ! git clone --branch "$branch" --single-branch "$repo_url" "$clone_dir" 2>&1; then
+    rm -rf "$clone_dir"
     msg_error "Falló el clone. Verifica la URL y que la deploy key esté añadida en GitHub."
     return 1
   fi
 
-  chown -R www-data:www-data "$site_dir"
-  find "$site_dir" -not -path "${site_dir}/.git/*" -type d -exec chmod 755 {} \;
-  find "$site_dir" -not -path "${site_dir}/.git/*" -type f -exec chmod 644 {} \;
-  _apply_writable_perms "$site_dir"
+  local backup_dir=""
+  if [[ "$preserve_existing" == "s" ]]; then
+    install -d -m 0700 "$SITE_BACKUP_DIR"
+    backup_dir="${SITE_BACKUP_DIR}/${site}-$(date +%Y%m%d-%H%M%S)"
+    if ! mv "$site_dir" "$backup_dir"; then
+      rm -rf "$clone_dir"
+      msg_error "No se pudo respaldar ${site_dir}. No se modificó el sitio actual."
+      return 1
+    fi
+  fi
+  if ! mv "$clone_dir" "$site_dir"; then
+    [[ -n "$backup_dir" && -d "$backup_dir" ]] && mv "$backup_dir" "$site_dir" || true
+    msg_error "No se pudo activar el clon; se intentó restaurar el sitio anterior."
+    return 1
+  fi
+  msg_ok "Repositorio clonado."
+  [[ -n "$backup_dir" ]] && msg_ok "Backup anterior: ${backup_dir}"
+
+  if [[ -n "$backup_dir" ]]; then
+    if [[ -f "${backup_dir}/.env" && ! -f "${site_dir}/.env" ]]; then
+      cp -a "${backup_dir}/.env" "${site_dir}/.env"
+      msg_ok "Archivo .env restaurado desde el sitio anterior."
+    fi
+    local runtime_rel
+    for runtime_rel in storage public/uploads; do
+      if [[ -d "${backup_dir}/${runtime_rel}" ]]; then
+        mkdir -p "${site_dir}/${runtime_rel}"
+        cp -a "${backup_dir}/${runtime_rel}/." "${site_dir}/${runtime_rel}/"
+        msg_ok "Datos de ejecución restaurados: ${runtime_rel}"
+      fi
+    done
+  fi
+
+  _git_allow_directory "$site_dir"
+  _apply_site_code_perms "$site_dir"
 
   echo
   msg_info "Últimos commits:"
@@ -4152,11 +4719,19 @@ git_clone_site() {
 
 _git_pull_dir() {
   local site="$1" site_dir="$2"
+  _git_allow_directory "$site_dir"
   local branch; branch="$(git -C "$site_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'main')"
 
-  msg_info "Branch: ${branch}  —  ejecutando git pull..."
-  if ! git -C "$site_dir" pull origin "$branch" 2>&1; then
-    msg_error "git pull falló. Verifica conectividad y que la deploy key esté activa en GitHub."
+  if [[ -n "$(git -C "$site_dir" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+    msg_error "Hay cambios locales en archivos versionados. Se cancela para no sobrescribirlos."
+    git -C "$site_dir" status --short --untracked-files=no | sed 's/^/    /'
+    return 1
+  fi
+
+  msg_info "Branch: ${branch} — fetch + avance fast-forward únicamente..."
+  if ! git -C "$site_dir" fetch --prune origin "$branch" 2>&1 \
+     || ! git -C "$site_dir" merge --ff-only "origin/${branch}" 2>&1; then
+    msg_error "Deploy cancelado: no fue posible un avance fast-forward seguro."
     return 1
   fi
 
@@ -4166,8 +4741,7 @@ _git_pull_dir() {
   git -C "$site_dir" log --oneline -5 2>/dev/null || true
   echo
 
-  chown -R www-data:www-data "$site_dir"
-  _apply_writable_perms "$site_dir"
+  _apply_site_code_perms "$site_dir"
 
   _git_post_deploy_prompt "$site" "$site_dir"
 }
@@ -4200,7 +4774,7 @@ _git_post_deploy_prompt() {
   echo "  ¿Ejecutar acciones post-deploy?"
   echo
   echo "  1) Recargar Nginx + PHP-FPM"
-  echo "  2) npm install && npm run build  (assets JS/CSS)"
+  echo "  2) npm ci/install && npm run build  (assets JS/CSS)"
   echo "  3) Todo: npm build + recarga de servicios"
   echo "  0) Omitir"
   echo
@@ -4224,10 +4798,17 @@ _deploy_npm() {
     && { msg_warn "package.json no encontrado en ${dir}"; return 0; }
   command -v npm >/dev/null 2>&1 \
     || { msg_warn "npm no está instalado en el servidor."; return 1; }
-  msg_info "Ejecutando npm install..."
-  npm install --prefix "$dir" 2>&1 \
-    && msg_ok "npm install completado." \
-    || { msg_error "npm install falló."; return 1; }
+  if [[ -f "${dir}/package-lock.json" ]]; then
+    msg_info "Ejecutando npm ci desde package-lock.json..."
+    npm ci --prefix "$dir" 2>&1 \
+      && msg_ok "npm ci completado." \
+      || { msg_error "npm ci falló."; return 1; }
+  else
+    msg_warn "No hay package-lock.json; se usará npm install."
+    npm install --prefix "$dir" 2>&1 \
+      && msg_ok "npm install completado." \
+      || { msg_error "npm install falló."; return 1; }
+  fi
   msg_info "Ejecutando npm run build..."
   npm run build --prefix "$dir" 2>&1 \
     && msg_ok "npm run build completado." \
@@ -4399,8 +4980,8 @@ menu_web_stack() {
     echo -e "  ${CYAN} 4)${RESET} Listar sitios"
     echo -e "  ${CYAN} 5)${RESET} Probar sitio"
     echo -e "  ${CYAN} 6)${RESET} Eliminar sitio"
-    echo -e "  ${CYAN} 7)${RESET} Eliminar archivos de diagnóstico (info.php, test-db.php)"
-    echo -e "  ${CYAN} 8)${RESET} Reparar permisos storage/uploads"
+    echo -e "  ${CYAN} 7)${RESET} Limpiar diagnósticos heredados (info.php, test-db.php)"
+    echo -e "  ${CYAN} 8)${RESET} Reparar permisos de código, storage y uploads"
     menu_cat "Servicios y PHP" "$CYAN"
     echo -e "  ${CYAN} 9)${RESET} Recargar Nginx + PHP-FPM"
     echo -e "  ${CYAN}10)${RESET} Cambiar límite de subida de archivos"
@@ -4435,9 +5016,17 @@ menu_web_stack() {
 }
 
 header_mariadb() {
+  local engine_status engine_label
+  engine_label="$(db_label)"
+  if mariadb_installed; then
+    mariadb_running && engine_status="${GREEN}● activo${RESET}" || engine_status="${YELLOW}● inactivo${RESET}"
+  else
+    engine_status="${RED}● no instalado${RESET}"
+  fi
   echo -e "${BOLD}${MAGENTA}╔══════════════════════════════════════════════╗${RESET}"
-  echo -e "${BOLD}${MAGENTA}║${WHITE}  [ 2 ] MariaDB — Base de Datos             ${MAGENTA}║${RESET}"
+  echo -e "${BOLD}${MAGENTA}║${WHITE}  [ 2 ] MySQL / MariaDB — Base de Datos     ${MAGENTA}║${RESET}"
   echo -e "${BOLD}${MAGENTA}╚══════════════════════════════════════════════╝${RESET}"
+  echo -e "  Motor: ${BOLD}${engine_label}${RESET}  ${engine_status}"
 }
 
 menu_mariadb() {
@@ -4446,7 +5035,7 @@ menu_mariadb() {
     clear
     header_mariadb; echo
     menu_cat "Instalación" "$MAGENTA"
-    echo -e "  ${MAGENTA} 1)${RESET} Instalar MariaDB"
+    echo -e "  ${MAGENTA} 1)${RESET} Instalar motor SQL  (MariaDB o MySQL Community)"
     echo -e "  ${MAGENTA} 2)${RESET} Configurar bind-address"
     menu_cat "Bases de datos" "$MAGENTA"
     echo -e "  ${MAGENTA} 3)${RESET} Crear base de datos + usuario"
@@ -4464,12 +5053,15 @@ menu_mariadb() {
     echo -e "  ${MAGENTA}13)${RESET} Cambiar host de usuario  (localhost ↔ % ↔ IP)"
     echo -e "  ${MAGENTA}14)${RESET} Cambiar privilegios de usuario"
     menu_cat "Backup / Restauración" "$MAGENTA"
-    echo -e "  ${MAGENTA}15)${RESET} Backup base de datos  (mysqldump → /var/backups/mariadb)"
+    echo -e "  ${MAGENTA}15)${RESET} Backup base de datos  (dump comprimido por motor)"
     echo -e "  ${MAGENTA}16)${RESET} Restaurar base de datos desde backup"
     menu_cat "Eliminación y seguridad" "$MAGENTA"
     echo -e "  ${MAGENTA}17)${RESET} Eliminar base de datos"
     echo -e "  ${MAGENTA}18)${RESET} Eliminar usuario"
     echo -e "  ${MAGENTA}19)${RESET} Recordatorio mysql_secure_installation"
+    menu_cat "Operación y diagnóstico" "$MAGENTA"
+    echo -e "  ${MAGENTA}20)${RESET} Diagnóstico del motor SQL (versión, puerto, conexiones)"
+    echo -e "  ${MAGENTA}21)${RESET} Backup COMPLETO (usuarios + grants + todas las bases)"
     echo
     echo -e "  ${MAGENTA} 0)${RESET} ← Volver al menú principal"
     echo
@@ -4494,6 +5086,8 @@ menu_mariadb() {
       17) run_item header_mariadb delete_database ;;
       18) run_item header_mariadb delete_user ;;
       19) run_item header_mariadb mariadb_secure_hint ;;
+      20) run_item header_mariadb db_health_check ;;
+      21) run_item header_mariadb dump_all_databases ;;
       0)  return ;;
       *)  msg_error "Opción inválida."; pause ;;
     esac
@@ -4655,7 +5249,7 @@ main_menu() {
     clear
     echo -e "${BOLD}${BLUE}╔══════════════════════════════════════════════════╗${RESET}"
     echo -e "${BOLD}${BLUE}║${WHITE}   DevLab Manager v${SCRIPT_VERSION}  ${BLUE}║${RESET}"
-    echo -e "${BOLD}${BLUE}║${WHITE}   Nginx · PHP ${php_lbl} · MariaDB · Debian ${deb_lbl} ${BLUE}║${RESET}"
+    echo -e "${BOLD}${BLUE}║${WHITE}   Nginx · PHP ${php_lbl} · $(db_label) · Debian ${deb_lbl} ${BLUE}║${RESET}"
     echo -e "${BOLD}${BLUE}╚══════════════════════════════════════════════════╝${RESET}"
     echo
 
@@ -4670,7 +5264,7 @@ main_menu() {
     else
       php_s="${RED}●${RESET}"
     fi
-    echo -e "  Nginx ${ng_s}   PHP-FPM ${php_s}   MariaDB ${db_s}   Cloudflared ${cf_s}"
+    echo -e "  Nginx ${ng_s}   PHP-FPM ${php_s}   $(db_label) ${db_s}   Cloudflared ${cf_s}"
     echo
 
     local ip_local ip_publica
@@ -4681,11 +5275,11 @@ main_menu() {
     echo
 
     echo -e "  ${CYAN}1)${RESET} ${BOLD}Stack Web${RESET}      — Nginx, PHP-FPM, sitios"
-    echo -e "  ${MAGENTA}2)${RESET} ${BOLD}MariaDB${RESET}        — Instalación, bases, usuarios"
+    echo -e "  ${MAGENTA}2)${RESET} ${BOLD}MySQL / MariaDB${RESET} — Instalación, bases, usuarios"
     echo -e "  ${YELLOW}3)${RESET} ${BOLD}Cloudflare${RESET}     — Tunnel, config, DNS"
     echo -e "  ${GREEN}4)${RESET} ${BOLD}Git / Deploy${RESET}   — Deploy key, clone, pull, post-deploy"
     echo -e "  ${WHITE}5)${RESET} ${BOLD}Sistema${RESET}        — Hora, zona horaria, actualizaciones"
-    echo -e "  ${RED}6)${RESET} ${BOLD}Seguridad${RESET}      — Firewall, fail2ban, SSH, auditoría"
+    echo -e "  ${RED}6)${RESET} ${BOLD}Seguridad${RESET}      — Firewall, CrowdSec/Fail2ban, SSH, auditoría"
     echo -e "  ${GREEN}7)${RESET} ${BOLD}Monitor${RESET}        — Dashboard en vivo (CPU, RAM, red, sitios)"
     echo -e "  ${CYAN}8)${RESET} ${BOLD}Dev Tools${RESET}      — Logs, tráfico, benchmark, mantenimiento"
     echo -e "  ${WHITE}9)${RESET} ${BOLD}Estado${RESET}         — Resumen estático de servicios"
@@ -4716,7 +5310,7 @@ main_menu() {
 usage() {
   cat <<EOF
 DevLab Manager v${SCRIPT_VERSION}
-Gestor interactivo del stack web: Nginx · PHP-FPM · MariaDB · Cloudflared (Debian 12/13)
+Gestor interactivo del stack web: Nginx · PHP-FPM · MySQL/MariaDB · Cloudflared (Debian 12/13)
 
 Uso: $(basename "$0") [opción]
 
@@ -4739,6 +5333,10 @@ while [[ $# -gt 0 ]]; do
     *)            echo "Opción desconocida: $1" >&2; echo; usage; exit 2 ;;
   esac
 done
+
+if [[ "${DEVLAB_LIB_ONLY:-0}" == "1" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 setup_colors
 
