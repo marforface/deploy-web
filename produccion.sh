@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  DevLab Manager v2.0 - Marcos Espinoza Torres
+#  DevLab Manager v2.1 - Marcos Espinoza Torres
 #  Stack completo: Nginx · PHP-FPM · MySQL/MariaDB · Cloudflared | Debian 12/13
 # ==============================================================================
 set -euo pipefail
 
-readonly SCRIPT_VERSION="2.0 - Marcos Espinoza Torres"
+# Todo secreto o artefacto creado por este proceso nace privado. Las funciones
+# que necesitan lectura de Nginx/PHP abren permisos de forma explícita después.
+umask 077
+
+readonly SCRIPT_VERSION="2.1 - Marcos Espinoza Torres"
 readonly CATCH_ALL_FILE="/etc/nginx/sites-available/000-catch-all"
 readonly MARIADB_CNF="/etc/mysql/mariadb.conf.d/50-server.cnf"
 readonly MYSQL_CNF="/etc/mysql/mysql.conf.d/mysqld.cnf"
@@ -17,10 +21,14 @@ readonly PHP_SUPPORTED_VERSIONS=(8.1 8.2 8.3 8.4)
 readonly CLOUDFLARED_CONFIG="/etc/cloudflared/config.yml"
 readonly CLOUDFLARED_DIR="/etc/cloudflared"
 readonly GIT_DEPLOY_KEY="/root/.ssh/deploy_ed25519"
-readonly CROWDSEC_KEYRING="/etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg"
-readonly CROWDSEC_SOURCE="/etc/apt/sources.list.d/crowdsec_crowdsec.list"
-readonly CROWDSEC_ACQUIS="/etc/crowdsec/acquis.d/devlab-nginx.yaml"
+readonly FAIL2BAN_JAIL="/etc/fail2ban/jail.d/99-devlab.local"
 readonly SITE_BACKUP_DIR="/var/backups/devlab/sites"
+readonly DEVLAB_STATE_DIR="/var/lib/devlab"
+readonly DEVLAB_POOL_PREFIX="devlab-"
+readonly DEVLAB_GLOBAL_DIR="/usr/local/libexec/devlab"
+readonly CLOUDFLARED_KEYRING="/usr/share/keyrings/cloudflare-main.gpg"
+readonly CLOUDFLARED_APT_SOURCE="/etc/apt/sources.list.d/cloudflared.list"
+readonly GITHUB_ED25519_HOST_KEY="github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
 
 PHP_VERSION=""
 DEBIAN_CODENAME=""
@@ -39,9 +47,13 @@ CHOSEN_SITE=""
 REPLY_YESNO=""
 REPLY_SIZE=""
 DB_PASS_VALUE=""
+DB_PASS_GENERATED="n"
 REPLY_HOST=""
 SELECTED_DB_USER=""
 SELECTED_DB_HOST=""
+RUNTIME_USER=""
+RUNTIME_GROUP=""
+RUNTIME_SOCKET=""
 
 setup_colors() {
   if [[ "${NO_COLOR_FORCE:-n}" != "s" && -z "${NO_COLOR:-}" ]] \
@@ -73,8 +85,15 @@ run_item() {
   clear
   "$header_fn"
   echo
-  "$@" || true
+  local rc=0
+  "$@" || rc=$?
+  if (( rc != 0 )); then
+    echo
+    msg_error "La operación terminó con error (código ${rc}). No se marcó como completada."
+  fi
   pause
+  # El menú sigue disponible, pero el fallo ya no queda oculto al operador.
+  return 0
 }
 
 pause() { echo; read -rp "  Presiona Enter para continuar..."; }
@@ -155,11 +174,24 @@ prompt_password_generic() {
   local label="${1:-Clave}"
   local pass1 pass2
   while true; do
-    read -rsp "  ${label}: " pass1; echo
+    read -rsp "  ${label} (Enter = generar una segura): " pass1; echo
+    if [[ -z "$pass1" ]]; then
+      command -v openssl >/dev/null 2>&1 \
+        || { msg_error "openssl es necesario para generar secretos seguros."; continue; }
+      pass1="$(openssl rand -base64 32 | tr -d '\n')"
+      DB_PASS_VALUE="$pass1"
+      DB_PASS_GENERATED="s"
+      msg_ok "Se generó un secreto aleatorio de alta entropía."
+      msg_warn "Guárdalo ahora en tu gestor de secretos: ${pass1}"
+      return 0
+    fi
+    if (( ${#pass1} < 16 )); then
+      msg_error "La clave manual debe tener al menos 16 caracteres."
+      continue
+    fi
     read -rsp "  Confirmar ${label,,}: " pass2; echo
-    [[ -z "$pass1" ]]          && msg_error "La clave no puede estar vacía." && continue
     [[ "$pass1" != "$pass2" ]] && msg_error "Las claves no coinciden."       && continue
-    DB_PASS_VALUE="$pass1"; return 0
+    DB_PASS_VALUE="$pass1"; DB_PASS_GENERATED="n"; return 0
   done
 }
 
@@ -490,44 +522,170 @@ install_php_extension() {
 # PERMISOS STORAGE / UPLOADS
 # ══════════════════════════════════════════════════════════════════════════════
 
+site_runtime_user() {
+  local site="$1" slug hash
+  slug="${site,,}"
+  slug="${slug//[^a-z0-9]/_}"
+  if command -v sha256sum >/dev/null 2>&1; then
+    hash="$(printf '%s' "$site" | sha256sum | awk '{print substr($1,1,8)}')"
+  else
+    hash="$(printf '%s' "$site" | shasum -a 256 | awk '{print substr($1,1,8)}')"
+  fi
+  printf 'dl_%s_%s\n' "${slug:0:18}" "$hash"
+}
+
+ensure_site_runtime() {
+  local site="$1" php_version="${2:-$PHP_VERSION}"
+  [[ -n "$site" && -n "$php_version" ]] || {
+    msg_error "No se pudo determinar sitio o versión PHP para crear el aislamiento."
+    return 1
+  }
+
+  RUNTIME_USER="$(site_runtime_user "$site")"
+  RUNTIME_GROUP="$RUNTIME_USER"
+  RUNTIME_SOCKET="/run/php/${DEVLAB_POOL_PREFIX}${site}.sock"
+  local state_dir="${DEVLAB_STATE_DIR}/sites/${site}"
+  local session_dir="${state_dir}/sessions"
+  local upload_tmp_dir="${state_dir}/tmp"
+  local pool_file="/etc/php/${php_version}/fpm/pool.d/${DEVLAB_POOL_PREFIX}${site}.conf"
+
+  if ! id "$RUNTIME_USER" >/dev/null 2>&1; then
+    useradd --system --user-group --home-dir "$state_dir" --create-home \
+      --shell /usr/sbin/nologin "$RUNTIME_USER"
+    msg_ok "Identidad aislada creada: ${RUNTIME_USER}"
+  fi
+
+  install -d -o "$RUNTIME_USER" -g "$RUNTIME_GROUP" -m 0700 \
+    "$state_dir" "$session_dir" "$upload_tmp_dir"
+
+  local pool_tmp
+  pool_tmp="$(mktemp)"
+  cat > "$pool_tmp" <<EOF
+[${DEVLAB_POOL_PREFIX}${site}]
+user = ${RUNTIME_USER}
+group = ${RUNTIME_GROUP}
+listen = ${RUNTIME_SOCKET}
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+
+pm = dynamic
+pm.max_children = 10
+pm.start_servers = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 3
+pm.max_requests = 500
+
+clear_env = yes
+catch_workers_output = yes
+security.limit_extensions = .php
+php_admin_value[session.save_path] = ${session_dir}
+php_admin_value[upload_tmp_dir] = ${upload_tmp_dir}
+php_admin_flag[display_errors] = off
+php_admin_flag[log_errors] = on
+EOF
+  if [[ ! -f "$pool_file" ]]; then
+    install -o root -g root -m 0644 "$pool_tmp" "$pool_file"
+    if ! "php-fpm${php_version}" -t >/dev/null 2>&1; then
+      rm -f "$pool_file" "$pool_tmp"
+      msg_error "El pool aislado generado para ${site} no pasó la validación PHP-FPM."
+      return 1
+    fi
+    systemctl reload "php${php_version}-fpm" 2>/dev/null \
+      || systemctl restart "php${php_version}-fpm"
+  fi
+  rm -f "$pool_tmp"
+}
+
 _apply_writable_perms() {
-  local app_dir="$1"
+  local app_dir="$1" runtime_user="$2" runtime_group="$3"
   local writable_dirs=("${app_dir}/storage" "${app_dir}/public/uploads")
 
   for dir in "${writable_dirs[@]}"; do
     [[ -d "$dir" ]] || continue
-    chown -R www-data:www-data "$dir"
-    # setgid: subdirectorios nuevos heredan grupo www-data
-    chmod 2775 "$dir"
-    find "$dir" -type d -exec chmod 2775 {} \;
-    find "$dir" -type f -exec chmod 664 {} \;
-    # ACL por defecto: archivos/dirs creados por PHP heredan rwX para www-data
-    if command -v setfacl >/dev/null 2>&1; then
-      setfacl -R  -m  "u:www-data:rwX,g:www-data:rwX" "$dir" 2>/dev/null || true
-      setfacl -R  -d  -m "u:www-data:rwX,g:www-data:rwX" "$dir" 2>/dev/null || true
-      setfacl -R  -m  "o::r-X" "$dir" 2>/dev/null || true
-      setfacl -R  -d  -m "o::r-X" "$dir" 2>/dev/null || true
-    fi
+    chown -R "$runtime_user:$runtime_group" "$dir"
+    chmod 2770 "$dir"
+    find "$dir" -type d -exec chmod 2770 {} \;
+    find "$dir" -type f -exec chmod 660 {} \;
     msg_ok "Permisos aplicados: ${dir}"
   done
+}
+
+_git_restore_tracked_exec_modes() {
+  local repo_dir="$1"
+  [[ -d "${repo_dir}/.git" ]] || return 0
+
+  local registro modo ruta_versionada
+  while IFS= read -r -d '' registro; do
+    modo="${registro%% *}"
+    ruta_versionada="${registro#*$'\t'}"
+    if [[ "$modo" == "100755" && -f "${repo_dir}/${ruta_versionada}" ]]; then
+      chmod 0750 "${repo_dir}/${ruta_versionada}"
+    fi
+  done < <(git -C "$repo_dir" ls-files --stage -z)
 }
 
 _apply_site_code_perms() {
   local app_dir="$1"
   [[ -d "$app_dir" ]] || return 0
+  local site="${app_dir##*/}"
+  ensure_site_runtime "$site" || return 1
+  local nginx_conf="/etc/nginx/sites-available/${site}"
+  if [[ -f "$nginx_conf" ]] \
+     && ! grep -Fq "fastcgi_pass unix:${RUNTIME_SOCKET};" "$nginx_conf"; then
+    local nginx_backup
+    nginx_backup="$(mktemp)"
+    cp -a "$nginx_conf" "$nginx_backup"
+    sed -i -E "s#fastcgi_pass unix:/run/php/[^;]+;#fastcgi_pass unix:${RUNTIME_SOCKET};#" "$nginx_conf"
+    if nginx -t >/dev/null 2>&1; then
+      systemctl reload nginx
+      msg_ok "Nginx migrado al socket aislado: ${RUNTIME_SOCKET}"
+    else
+      cp -a "$nginx_backup" "$nginx_conf"
+      rm -f "$nginx_backup"
+      msg_error "No se pudo migrar Nginx al pool aislado; configuración restaurada."
+      return 1
+    fi
+    rm -f "$nginx_backup"
+  fi
 
-  # El proceso web puede leer el código, pero no modificarlo. Solo los
-  # directorios declarados como escribibles quedan bajo control de www-data.
-  chown -R root:www-data "$app_dir"
-  find "$app_dir" -type d -not -path "${app_dir}/.git*" -exec chmod 755 {} \;
-  find "$app_dir" -type f -not -path "${app_dir}/.git/*" -exec chmod 644 {} \;
+  # PHP solo puede leer su propia aplicación. Nginx recibe lectura únicamente
+  # sobre public/ mediante ACL, nunca sobre .env, storage, logs o repositorio.
+  chown -R "root:${RUNTIME_GROUP}" "$app_dir"
+  find "$app_dir" -type d -not -path "${app_dir}/.git*" -exec chmod 750 {} \;
+  find "$app_dir" -type f -not -path "${app_dir}/.git/*" -exec chmod 640 {} \;
+
+  # Git conserva en su índice si un archivo versionado es ejecutable. El
+  # chmod general anterior debe respetar ese dato: si todos quedan en 0640,
+  # el siguiente pull detecta cambios locales de modo (100755 -> 100644) y se
+  # cancela aunque el contenido sea idéntico. Solo se restaura ejecución a los
+  # archivos que el propio repositorio declara 100755.
+  _git_restore_tracked_exec_modes "$app_dir"
+
   if [[ -d "${app_dir}/.git" ]]; then
     chown -R root:root "${app_dir}/.git"
     find "${app_dir}/.git" -type d -exec chmod 700 {} \;
     find "${app_dir}/.git" -type f -exec chmod 600 {} \;
   fi
-  [[ -f "${app_dir}/.env" ]] && chown root:www-data "${app_dir}/.env" && chmod 640 "${app_dir}/.env"
-  _apply_writable_perms "$app_dir"
+  [[ -f "${app_dir}/.env" ]] \
+    && chown "root:${RUNTIME_GROUP}" "${app_dir}/.env" \
+    && chmod 640 "${app_dir}/.env"
+  _apply_writable_perms "$app_dir" "$RUNTIME_USER" "$RUNTIME_GROUP"
+
+  if [[ -d "${app_dir}/public" ]]; then
+    if command -v setfacl >/dev/null 2>&1; then
+      setfacl -R -m "u:www-data:r-X" "${app_dir}/public"
+      find "${app_dir}/public" -type d \
+        -exec setfacl -m "d:u:www-data:r-X" {} \;
+      # El directorio raíz solo necesita permiso de travesía para llegar a public.
+      setfacl -m "u:www-data:--x" "$app_dir"
+    else
+      msg_warn "ACL no disponible: se aplicará lectura pública compatible con Nginx solo en public/."
+      find "${app_dir}/public" -type d -exec chmod 755 {} \;
+      find "${app_dir}/public" -type f -exec chmod 644 {} \;
+      chmod 751 "$app_dir"
+    fi
+  fi
 }
 
 fix_storage_permissions() {
@@ -592,12 +750,12 @@ fix_storage_permissions() {
 
   echo
   msg_info "Permisos aplicados:"
-  printf '  %-30s %s\n' "Código:"                 "root:www-data, solo lectura para el servicio web"
+  printf '  %-30s %s\n' "Código:"                 "root:<usuario-app>, aislado por aplicación"
   printf '  %-30s %s\n' ".git/:"                  "root:root, 700/600"
-  printf '  %-30s %s\n' "Directorios writable:"   "2775 + setgid (grupo www-data)"
-  printf '  %-30s %s\n' "Archivos dentro:"         "664"
+  printf '  %-30s %s\n' "Directorios writable:"   "2770 + setgid (sin acceso para otros)"
+  printf '  %-30s %s\n' "Archivos dentro:"         "660"
   if command -v setfacl >/dev/null 2>&1; then
-    printf '  %-30s %s\n' "ACL por defecto:" "www-data:rwX (heredado en subdirs nuevos)"
+    printf '  %-30s %s\n' "ACL Nginx:" "lectura limitada a public/"
   else
     printf '  %-30s %s\n' "ACL:" "no disponible — instala el paquete acl"
   fi
@@ -614,6 +772,20 @@ site_has_residue() {
      -d "/var/www/${n}" ]]
 }
 
+remove_site_runtime() {
+  local site="$1" php_version="${PHP_VERSION:-}"
+  local runtime_user
+  runtime_user="$(site_runtime_user "$site")"
+  if [[ -n "$php_version" ]]; then
+    rm -f "/etc/php/${php_version}/fpm/pool.d/${DEVLAB_POOL_PREFIX}${site}.conf"
+    "php-fpm${php_version}" -t >/dev/null 2>&1 \
+      && systemctl reload "php${php_version}-fpm" 2>/dev/null || true
+  fi
+  [[ -d "${DEVLAB_STATE_DIR}/sites/${site}" ]] \
+    && rm -rf "${DEVLAB_STATE_DIR}/sites/${site}"
+  id "$runtime_user" >/dev/null 2>&1 && userdel "$runtime_user" 2>/dev/null || true
+}
+
 cleanup_site_residue() {
   local name="$1" remove_dir="${2:-s}" removed="n"
   for target in "/etc/nginx/sites-enabled/${name}" "/etc/nginx/sites-available/${name}"; do
@@ -623,6 +795,7 @@ cleanup_site_residue() {
   done
   if [[ "${remove_dir}" == "s" && -d "/var/www/${name}" ]]; then
     rm -rf "/var/www/${name}" || true; msg_warn "Eliminado: /var/www/${name}"; removed="s"
+    remove_site_runtime "$name"
   fi
   if [[ "${removed}" == "s" ]]; then
     nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
@@ -751,6 +924,7 @@ EOF
 }
 
 nginx_php_location_block() {
+  local socket="${RUNTIME_SOCKET:-/run/php/${DEVLAB_POOL_PREFIX}${APP_NAME}.sock}"
   cat <<EOF
     location / {
         try_files \$uri \$uri/ /index.php?\$query_string;
@@ -760,7 +934,7 @@ nginx_php_location_block() {
     }
     location ~ \.php$ {
         include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/run/php/php${PHP_VERSION}-fpm.sock;
+        fastcgi_pass unix:${socket};
         fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
         include fastcgi_params;
     }
@@ -787,15 +961,21 @@ EOF
 }
 
 configure_php_upload_limits() {
-  local php_ini="/etc/php/${PHP_VERSION}/fpm/php.ini"
-  [[ ! -f "$php_ini" ]] && { msg_warn "No se encontró ${php_ini}. Saltando."; return 0; }
-  sed -i "s/^upload_max_filesize\s*=.*/upload_max_filesize = ${UPLOAD_MAX_SIZE}/" "$php_ini"
-  sed -i "s/^post_max_size\s*=.*/post_max_size = ${UPLOAD_MAX_SIZE}/"             "$php_ini"
-  sed -i "s/^max_execution_time\s*=.*/max_execution_time = 300/"                  "$php_ini"
-  sed -i "s/^max_input_time\s*=.*/max_input_time = 300/"                          "$php_ini"
-  sed -i "s/^memory_limit\s*=.*/memory_limit = 256M/"                             "$php_ini"
-  systemctl restart "php${PHP_VERSION}-fpm"
-  msg_ok "PHP-FPM reiniciado con límites de subida: ${UPLOAD_MAX_SIZE}."
+  local pool_file="/etc/php/${PHP_VERSION}/fpm/pool.d/${DEVLAB_POOL_PREFIX}${APP_NAME}.conf"
+  [[ -f "$pool_file" ]] || { msg_error "No se encontró el pool aislado ${pool_file}."; return 1; }
+  cat >> "$pool_file" <<EOF
+php_admin_value[upload_max_filesize] = ${UPLOAD_MAX_SIZE}
+php_admin_value[post_max_size] = ${UPLOAD_MAX_SIZE}
+php_admin_value[max_execution_time] = 300
+php_admin_value[max_input_time] = 300
+php_admin_value[memory_limit] = 256M
+EOF
+  "php-fpm${PHP_VERSION}" -t >/dev/null 2>&1 || {
+    msg_error "El pool PHP no pasó la validación después de aplicar límites."
+    return 1
+  }
+  systemctl reload "php${PHP_VERSION}-fpm"
+  msg_ok "Pool aislado recargado con límites de subida: ${UPLOAD_MAX_SIZE}."
 }
 
 change_upload_limits() {
@@ -805,14 +985,19 @@ change_upload_limits() {
   choose_site || return 0
   local site="$CHOSEN_SITE"
   local nginx_conf="/etc/nginx/sites-available/${site}"
-  local php_ini="/etc/php/${PHP_VERSION}/fpm/php.ini"
+  local pool_file="/etc/php/${PHP_VERSION}/fpm/pool.d/${DEVLAB_POOL_PREFIX}${site}.conf"
+  [[ -f "$pool_file" ]] || {
+    msg_error "El sitio aún no tiene pool aislado. Ejecuta primero Stack Web → opción 8."
+    return 1
+  }
 
   # Leer valores actuales
   local cur_nginx cur_upload cur_post cur_mem
   cur_nginx="$(awk '/client_max_body_size / {gsub(/;/,"",$2); print $2; exit}' "$nginx_conf" 2>/dev/null || echo '—')"
-  cur_upload="$(awk -F'=' '/^upload_max_filesize\s*=/ {gsub(/ /,"",$2); print $2; exit}' "$php_ini" 2>/dev/null || echo '—')"
-  cur_post="$(awk   -F'=' '/^post_max_size\s*=/        {gsub(/ /,"",$2); print $2; exit}' "$php_ini" 2>/dev/null || echo '—')"
-  cur_mem="$(awk    -F'=' '/^memory_limit\s*=/          {gsub(/ /,"",$2); print $2; exit}' "$php_ini" 2>/dev/null || echo '—')"
+  cur_upload="$(awk -F'=' '/php_admin_value\[upload_max_filesize\]/ {gsub(/ /,"",$2); print $2; exit}' "$pool_file" 2>/dev/null || true)"
+  cur_post="$(awk   -F'=' '/php_admin_value\[post_max_size\]/        {gsub(/ /,"",$2); print $2; exit}' "$pool_file" 2>/dev/null || true)"
+  cur_mem="$(awk    -F'=' '/php_admin_value\[memory_limit\]/          {gsub(/ /,"",$2); print $2; exit}' "$pool_file" 2>/dev/null || true)"
+  cur_upload="${cur_upload:-20M}"; cur_post="${cur_post:-24M}"; cur_mem="${cur_mem:-256M}"
 
   echo
   printf "  ${BOLD}Sitio:${RESET} %s\n" "$site"
@@ -878,14 +1063,23 @@ change_upload_limits() {
     msg_error "Validación Nginx falló. Revisa ${nginx_conf}."; return 1
   fi
 
-  if [[ ! -f "$php_ini" ]]; then
-    msg_warn "No se encontró ${php_ini}. Saltando configuración PHP."
+  _pool_set() {
+    local key="$1" value="$2"
+    if grep -q "^php_admin_value\[${key}\]" "$pool_file"; then
+      sed -i "s#^php_admin_value\[${key}\].*#php_admin_value[${key}] = ${value}#" "$pool_file"
+    else
+      printf 'php_admin_value[%s] = %s\n' "$key" "$value" >> "$pool_file"
+    fi
+  }
+  _pool_set upload_max_filesize "$new_upload"
+  _pool_set post_max_size "$new_post"
+  _pool_set memory_limit "$new_mem"
+  if "php-fpm${PHP_VERSION}" -t >/dev/null 2>&1; then
+    systemctl reload "php${PHP_VERSION}-fpm"
+    msg_ok "Pool PHP aislado recargado."
   else
-    sed -i "s/^upload_max_filesize\s*=.*/upload_max_filesize = ${new_upload}/" "$php_ini"
-    sed -i "s/^post_max_size\s*=.*/post_max_size = ${new_post}/"               "$php_ini"
-    sed -i "s/^memory_limit\s*=.*/memory_limit = ${new_mem}/"                  "$php_ini"
-    systemctl restart "php${PHP_VERSION}-fpm"
-    msg_ok "PHP-FPM reiniciado."
+    msg_error "La configuración del pool no pasó php-fpm -t."
+    return 1
   fi
 
   echo
@@ -1821,13 +2015,15 @@ dump_database() {
 
   local dump_dir
   dump_dir="$(db_backup_dir)"
-  mkdir -p "$dump_dir"
+  install -d -o root -g root -m 0700 "$dump_dir"
   local dump_file
   dump_file="${dump_dir}/${db_name}_$(date +%F_%H%M%S).sql.gz"
+  install -o root -g root -m 0600 /dev/null "$dump_file"
 
   msg_info "Volcando ${db_name} → ${dump_file}..."
   if mysqldump --single-transaction --quick --lock-tables=false "$db_name" \
      | gzip > "$dump_file"; then
+    chmod 600 "$dump_file"
     local size; size="$(du -sh "$dump_file" | cut -f1)"
     msg_ok "Backup completado: ${dump_file}  (${size})"
   else
@@ -2156,9 +2352,11 @@ install_global_command() {
   fi
 
   local link_path="/usr/local/bin/devlab"
+  local installed_path="${DEVLAB_GLOBAL_DIR}/produccion.sh"
 
   echo "  Script actual:  ${script_path}"
-  echo "  Enlace a crear: ${link_path}"
+  echo "  Copia inmutable: ${installed_path}"
+  echo "  Enlace a crear:  ${link_path}"
   echo
 
   if [[ -L "$link_path" ]]; then
@@ -2170,9 +2368,11 @@ install_global_command() {
     msg_error "${link_path} ya existe y no es un enlace simbólico. Revisa manualmente."; return 1
   fi
 
-  chmod +x "$script_path"
-  ln -sf "$script_path" "$link_path"
-  msg_ok "Enlace creado: ${link_path} → ${script_path}"
+  install -d -o root -g root -m 0755 "$DEVLAB_GLOBAL_DIR"
+  install -o root -g root -m 0750 "$script_path" "$installed_path"
+  ln -sf "$installed_path" "$link_path"
+  msg_ok "Copia protegida instalada: ${installed_path} (root:root, 0750)"
+  msg_ok "Enlace creado: ${link_path} → ${installed_path}"
   echo
   msg_info "Ahora puedes ejecutar el script desde cualquier ruta con:"
   echo
@@ -2195,7 +2395,9 @@ remove_global_command() {
   [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado."; return 0; }
 
   rm -f "$link_path"
-  msg_ok "Enlace eliminado. El script original no fue modificado."
+  rm -f "${DEVLAB_GLOBAL_DIR}/produccion.sh"
+  rmdir "$DEVLAB_GLOBAL_DIR" 2>/dev/null || true
+  msg_ok "Comando global y copia protegida eliminados. El script original no fue modificado."
 }
 
 sys_update() {
@@ -2257,29 +2459,33 @@ cf_install() {
     msg_warn "cloudflared ya está instalado: $(cloudflared --version 2>&1 | head -1)"
     return 0
   fi
-  local arch deb_arch
-  arch="$(dpkg --print-architecture 2>/dev/null || uname -m)"
-  case "$arch" in
-    amd64|x86_64)     deb_arch="amd64" ;;
-    arm64|aarch64)    deb_arch="arm64" ;;
-    armhf|armv7l|arm) deb_arch="arm"   ;;
-    i386|i686)        deb_arch="386"   ;;
-    *) msg_error "Arquitectura no soportada: ${arch}"; return 1 ;;
-  esac
-  msg_info "Arquitectura detectada: ${arch} → cloudflared-linux-${deb_arch}"
+  msg_info "Instalando desde el repositorio APT firmado de Cloudflare..."
+  apt-get install -y ca-certificates curl gnupg
+  install -d -m 0755 /usr/share/keyrings /etc/apt/sources.list.d
 
-  local tmp url
-  tmp="$(mktemp -d)"
-  url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${deb_arch}.deb"
-  msg_info "Descargando cloudflared..."
-  if ! wget -qO "${tmp}/cloudflared.deb" "$url"; then
-    msg_error "Falló la descarga desde: ${url}"; rm -rf "$tmp"; return 1
+  local key_tmp key_dearmored
+  key_tmp="$(mktemp)"
+  key_dearmored="$(mktemp)"
+  if ! curl --fail --silent --show-error --location \
+      https://pkg.cloudflare.com/cloudflare-main.gpg --output "$key_tmp"; then
+    rm -f "$key_tmp" "$key_dearmored"
+    msg_error "No se pudo descargar la clave del repositorio oficial de Cloudflare."
+    return 1
   fi
-  if ! dpkg -i "${tmp}/cloudflared.deb"; then
-    msg_warn "dpkg reportó dependencias faltantes. Resolviendo con apt..."
-    apt-get install -f -y || { rm -rf "$tmp"; msg_error "No se pudieron resolver dependencias."; return 1; }
+  if ! gpg --batch --yes --dearmor --output "$key_dearmored" "$key_tmp"; then
+    rm -f "$key_tmp" "$key_dearmored"
+    msg_error "La clave descargada no tiene un formato OpenPGP válido."
+    return 1
   fi
-  rm -rf "$tmp"
+  install -o root -g root -m 0644 "$key_dearmored" "$CLOUDFLARED_KEYRING"
+  rm -f "$key_tmp" "$key_dearmored"
+
+  cat > "$CLOUDFLARED_APT_SOURCE" <<EOF
+deb [signed-by=${CLOUDFLARED_KEYRING}] https://pkg.cloudflare.com/cloudflared any main
+EOF
+  chmod 0644 "$CLOUDFLARED_APT_SOURCE"
+  apt-get update
+  apt-get install -y cloudflared
   msg_ok "cloudflared instalado: $(cloudflared --version 2>&1 | head -1)"
 }
 
@@ -2292,19 +2498,64 @@ cf_login() {
   msg_ok "Autenticación completada."
 }
 
+ensure_cloudflared_identity() {
+  if ! id cloudflared >/dev/null 2>&1; then
+    useradd --system --user-group --home-dir /var/lib/cloudflared --create-home \
+      --shell /usr/sbin/nologin cloudflared
+  fi
+  install -d -o root -g cloudflared -m 0750 "$CLOUDFLARED_DIR"
+  install -d -o cloudflared -g cloudflared -m 0700 /var/lib/cloudflared
+}
+
+cf_prepare_credentials() {
+  local uuid="$1" source_file="$2"
+  ensure_cloudflared_identity
+  local target="${CLOUDFLARED_DIR}/${uuid}.json"
+  if [[ "$(realpath "$source_file")" != "$(realpath -m "$target")" ]]; then
+    install -o root -g cloudflared -m 0640 "$source_file" "$target"
+  else
+    chown root:cloudflared "$target"
+    chmod 0640 "$target"
+  fi
+  printf '%s\n' "$target"
+}
+
 cf_write_systemd_unit() {
   local unit_file="/etc/systemd/system/cloudflared.service"
+  ensure_cloudflared_identity
+  chown root:cloudflared "$CLOUDFLARED_CONFIG"
+  chmod 0640 "$CLOUDFLARED_CONFIG"
   cat > "$unit_file" <<'UNIT'
 [Unit]
 Description=cloudflared
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-TimeoutStartSec=0
 Type=notify
-ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel run
+User=cloudflared
+Group=cloudflared
+Environment=HOME=/var/lib/cloudflared
+ExecStart=/usr/bin/cloudflared --config /etc/cloudflared/config.yml --no-autoupdate tunnel run
 Restart=on-failure
 RestartSec=5s
+TimeoutStartSec=60
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/cloudflared
 
 [Install]
 WantedBy=multi-user.target
@@ -2372,7 +2623,7 @@ _cf_build_config() {
   [[ -f "$CLOUDFLARED_CONFIG" ]] \
     && cp "$CLOUDFLARED_CONFIG" "${CLOUDFLARED_CONFIG}.bak.$(date +%F-%H%M%S)"
 
-  install -d -m 0755 "$CLOUDFLARED_DIR"
+  ensure_cloudflared_identity
   cat > "$CLOUDFLARED_CONFIG" <<EOF
 tunnel: ${uuid}
 credentials-file: ${creds_file}
@@ -2380,6 +2631,8 @@ credentials-file: ${creds_file}
 ingress:
 ${ingress_blocks}  - service: http_status:404
 EOF
+  chown root:cloudflared "$CLOUDFLARED_CONFIG"
+  chmod 0640 "$CLOUDFLARED_CONFIG"
 
   msg_ok "config.yml escrito: ${CLOUDFLARED_CONFIG}"
   echo; cat "$CLOUDFLARED_CONFIG"; echo
@@ -2455,6 +2708,9 @@ cf_create_tunnel() {
   fi
   msg_ok "Credenciales: ${creds_file}"
 
+  creds_file="$(cf_prepare_credentials "$uuid" "$creds_file")"
+  msg_ok "Credenciales protegidas para el servicio: ${creds_file}"
+
   _cf_build_config "$uuid" "$creds_file" "$tunnel_name"
 
   prompt_yes_no "¿Instalar/actualizar cloudflared como servicio systemd?" "s"
@@ -2503,6 +2759,8 @@ cf_regen_config() {
       msg_error "No se pudo leer tunnel/credentials del config actual."; return 1
     fi
   fi
+
+  creds="$(cf_prepare_credentials "$uuid" "$creds")"
 
   _cf_build_config "$uuid" "$creds" "$tunnel_name"
 
@@ -2788,10 +3046,13 @@ cf_uninstall() {
   if [[ "$remove_config" == "s" ]]; then
     rm -rf "$CLOUDFLARED_DIR" 2>/dev/null || true
     rm -rf /root/.cloudflared 2>/dev/null || true
+    rm -rf /var/lib/cloudflared 2>/dev/null || true
+    id cloudflared >/dev/null 2>&1 && userdel cloudflared 2>/dev/null || true
     msg_warn "Configuración y credenciales locales eliminadas."
   else
     msg_info "Se conservó ${CLOUDFLARED_DIR} y las credenciales locales."
   fi
+  rm -f "$CLOUDFLARED_APT_SOURCE" "$CLOUDFLARED_KEYRING" 2>/dev/null || true
 
   echo
   if command -v cloudflared >/dev/null 2>&1; then
@@ -2832,8 +3093,16 @@ _ssh_socket_active() {
 }
 
 _ssh_listening_port() {
-  # Puerto(s) real(es) en los que el proceso sshd está escuchando ahora mismo.
-  ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | grep -oE '[0-9]+$' | sort -un | tr '\n' ',' | sed 's/,$//'
+  # Puerto(s) reales servidos por sshd o por systemd socket activation.
+  {
+    ss -tlnp 2>/dev/null \
+      | awk '/sshd/ {print $4}' \
+      | grep -oE '[0-9]+$' || true
+    if _ssh_socket_active; then
+      systemctl show ssh.socket -p Listen --value 2>/dev/null \
+        | grep -oE ':[0-9]+' | tr -d ':' || true
+    fi
+  } | sort -un | tr '\n' ',' | sed 's/,$//'
 }
 
 sec_ssh_diagnose() {
@@ -2842,106 +3111,119 @@ sec_ssh_diagnose() {
   local sshd=/etc/ssh/sshd_config
   [[ ! -f "$sshd" ]] && { msg_warn "OpenSSH server no está instalado."; return 0; }
 
-  local cfg_port listen_port
+  local cfg_port listen_port config_valid="s" socket_was_active="n"
   cfg_port="$(_detect_ssh_port)"
   listen_port="$(_ssh_listening_port)"
 
   echo
-  printf "  %-38s %s\n" "Puerto configurado (sshd -T):"        "${cfg_port}"
+  printf "  %-38s %s\n" "Puerto efectivo (sshd -T):"           "$cfg_port"
   printf "  %-38s %s\n" "Puerto(s) real(es) en escucha (ss):"  "${listen_port:-ninguno detectado}"
   echo
 
   local problems=0
-
-  # 1) Archivos en sshd_config.d/ que puedan traer su propio Port
-  local conf_dir="/etc/ssh/sshd_config.d"
-  local conflicting=()
-  if [[ -d "$conf_dir" ]]; then
-    mapfile -t conflicting < <(grep -lE '^[[:space:]]*Port[[:space:]]' "${conf_dir}"/*.conf 2>/dev/null)
-  fi
-  if [[ "${#conflicting[@]}" -gt 0 ]]; then
-    ((problems++)) || true
-    msg_error "Hay Port declarado en archivos de Include (pueden pisar tu sshd_config):"
-    local f
-    for f in "${conflicting[@]}"; do
-      echo "      ${f}:  $(grep -E '^[[:space:]]*Port[[:space:]]' "$f")"
-    done
+  if sshd -t 2>/dev/null; then
+    msg_ok "La configuración completa de OpenSSH es válida (sshd -t)."
   else
-    msg_ok "Sin conflictos de 'Port' en ${conf_dir}/*.conf"
+    config_valid="n"
+    ((problems++)) || true
+    msg_error "La configuración de OpenSSH no supera sshd -t."
   fi
 
-  # 2) ssh.socket (systemd socket activation) fijando el puerto por su cuenta
+  # Los Include forman parte normal de OpenSSH. Se muestran para trazabilidad,
+  # pero solo sshd -T y el socket real determinan si existe un conflicto.
+  local conf_dir="/etc/ssh/sshd_config.d"
+  local include_port_lines=()
+  if [[ -d "$conf_dir" ]]; then
+    mapfile -t include_port_lines < <(
+      grep -HnE '^[[:space:]]*Port[[:space:]]+[0-9]+' "$conf_dir"/*.conf 2>/dev/null || true
+    )
+  fi
+  if [[ "${#include_port_lines[@]}" -gt 0 ]]; then
+    msg_info "Declaraciones Port encontradas en archivos Include:"
+    local entry
+    for entry in "${include_port_lines[@]}"; do
+      echo "      ${entry}"
+    done
+    msg_ok "Los Include son coherentes mientras sshd -T y el puerto escuchado coincidan."
+  else
+    msg_info "No hay declaraciones Port adicionales en ${conf_dir}/*.conf."
+  fi
+
   if _ssh_socket_active; then
-    ((problems++)) || true
-    msg_error "ssh.socket está activo/habilitado — controla el puerto de forma independiente"
-    msg_error "a sshd_config y puede hacer que SSH siga escuchando en el puerto viejo."
+    socket_was_active="s"
+    msg_info "ssh.socket está activo; es un modo válido si escucha en el puerto efectivo."
     local sock_listen
     sock_listen="$(systemctl show ssh.socket -p Listen 2>/dev/null | sed 's/^Listen=//')"
-    [[ -n "$sock_listen" ]] && echo "      ListenStream detectado: ${sock_listen}"
+    [[ -n "$sock_listen" ]] && echo "      Listen detectado: ${sock_listen}"
   else
-    msg_ok "ssh.socket inactivo (SSH corre directo vía ssh.service, como se espera)"
+    msg_ok "ssh.socket inactivo; SSH opera mediante ssh.service."
   fi
 
-  # 3) Config efectiva vs. puerto real en escucha
-  if [[ -n "$listen_port" ]] && [[ ",${listen_port}," != *",${cfg_port},"* ]]; then
+  if [[ -z "$listen_port" ]]; then
     ((problems++)) || true
-    msg_error "DESAJUSTE: sshd_config dice '${cfg_port}' pero sshd escucha en '${listen_port}'."
+    msg_error "No se detectó ningún proceso sshd escuchando."
+  elif [[ ",${listen_port}," != *",${cfg_port},"* ]]; then
+    ((problems++)) || true
+    msg_error "DESAJUSTE: la configuración efectiva indica '${cfg_port}', pero SSH escucha en '${listen_port}'."
+  else
+    msg_ok "El puerto efectivo y el puerto realmente escuchado coinciden."
   fi
 
   echo
-  if [[ $problems -eq 0 ]]; then
-    msg_ok "Todo consistente. SSH escuchando correctamente en el puerto ${cfg_port}."
+  if (( problems == 0 )); then
+    msg_ok "Configuración SSH consistente. No es necesario modificar nada."
     return 0
   fi
 
-  msg_warn "Se detectaron ${problems} problema(s) que pueden causar pérdida de acceso SSH."
-  echo
-  prompt_yes_no "¿Aplicar la reparación automática ahora?" "s"
-  [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Diagnóstico finalizado sin cambios."; return 0; }
+  msg_warn "Se detectaron ${problems} problema(s) reales que requieren atención."
+  if [[ "$config_valid" != "s" ]]; then
+    msg_error "No se realizará una reparación automática con sshd_config inválido."
+    msg_info "Revisa: sshd -t && sshd -T | grep -i '^port'"
+    return 1
+  fi
 
-  # Abrir el puerto configurado en UFW por si acaso, antes de reiniciar nada (anti-lockout)
+  echo
+  prompt_yes_no "¿Intentar sincronizar el servicio con el puerto efectivo ${cfg_port}?" "n"
+  [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Diagnóstico finalizado sin cambios."; return 1; }
+
+  # Anti-lockout: abrir primero el puerto efectivo, sin cerrar todavía ninguno.
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     ufw allow "${cfg_port}/tcp" comment 'SSH' >/dev/null 2>&1 || true
   fi
 
-  # Fix 1: comentar Port en archivos de Include (root causa más común)
-  local f
-  for f in "${conflicting[@]}"; do
-    cp "$f" "${f}.bak.$(date +%F-%H%M%S)"
-    sed -i -E "s/^([[:space:]]*Port[[:space:]].*)/# \1  # comentado por DevLab Manager (conflicto de puerto)/" "$f"
-    msg_ok "Comentado 'Port' en: ${f}"
-  done
-
-  # Fix 2: deshabilitar ssh.socket para que sshd_config mande de verdad
-  if _ssh_socket_active; then
-    systemctl stop ssh.socket 2>/dev/null || true
-    systemctl disable ssh.socket 2>/dev/null || true
-    msg_ok "ssh.socket detenido y deshabilitado."
+  # Solo se desactiva socket activation cuando provoca un desajuste real.
+  if [[ "$socket_was_active" == "s" ]]; then
+    systemctl disable --now ssh.socket >/dev/null 2>&1 || {
+      msg_error "No se pudo desactivar ssh.socket; no se reiniciará SSH."
+      return 1
+    }
+    msg_ok "ssh.socket desactivado para aplicar la configuración efectiva de sshd."
   fi
 
-  # Aplicar
-  if ! sshd -t 2>/dev/null; then
-    msg_error "sshd_config inválido tras los cambios. Revisa manualmente antes de reiniciar."
+  if ! { systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null; }; then
+    [[ "$socket_was_active" == "s" ]] && systemctl enable --now ssh.socket >/dev/null 2>&1 || true
+    msg_error "No se pudo reiniciar SSH; se restauró ssh.socket cuando correspondía."
     return 1
   fi
-  systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
   sleep 1
 
+  local new_listen
+  new_listen="$(_ssh_listening_port)"
   echo
-  local new_listen; new_listen="$(_ssh_listening_port)"
   printf "  %-38s %s\n" "Puerto(s) en escucha ahora:" "${new_listen:-ninguno detectado}"
-  echo
 
   if [[ ",${new_listen}," == *",${cfg_port},"* ]]; then
-    msg_ok "Reparado. SSH escucha correctamente en el puerto ${cfg_port}."
+    msg_ok "SSH escucha correctamente en el puerto ${cfg_port}."
     echo
-    msg_warn "PRUEBA AHORA desde OTRA terminal antes de cerrar esta sesión:"
+    msg_warn "Prueba desde otra terminal antes de cerrar esta sesión:"
     echo "      ssh -p ${cfg_port} root@$(detect_primary_ip 2>/dev/null || echo '<IP>')"
   else
-    msg_error "El puerto sigue sin coincidir. Revisa manualmente:"
+    [[ "$socket_was_active" == "s" ]] && systemctl enable --now ssh.socket >/dev/null 2>&1 || true
+    msg_error "El puerto sigue sin coincidir. Se requiere revisión manual."
+    echo "      sshd -t"
     echo "      sshd -T | grep -i '^port'"
     echo "      ss -tlnp | grep sshd"
-    echo "      systemctl status ssh.socket"
+    echo "      systemctl status ssh ssh.socket"
     return 1
   fi
 }
@@ -2969,7 +3251,9 @@ sec_install_ufw() {
   msg_info "(el tunnel es conexión saliente y no necesita puertos abiertos)."
   echo
 
-  prompt_yes_no "¿Abrir 80/443? (responde 'n' si solo usas Cloudflare Tunnel)" "s"
+  local web_default="s"
+  cf_installed && web_default="n"
+  prompt_yes_no "¿Abrir 80/443? (usa 'n' si solo publicas por Cloudflare Tunnel)" "$web_default"
   local open_web="$REPLY_YESNO"
 
   local mdb_rule="n" mdb_src=""
@@ -3010,195 +3294,308 @@ sec_install_ufw() {
   ufw status verbose | sed 's/^/    /'
 }
 
-sec_install_fail2ban() {
-  msg_section "Fail2ban — bloqueo de ataques por fuerza bruta"
 
-  if systemctl is-active --quiet crowdsec 2>/dev/null; then
-    msg_warn "CrowdSec está activo. Ejecutar ambos motores duplica bloqueos y dificulta el diagnóstico."
-    prompt_yes_no "¿Deshabilitar CrowdSec y usar Fail2ban?" "n"
-    [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Instalación cancelada; CrowdSec permanece activo."; return 0; }
-    systemctl disable --now crowdsec >/dev/null 2>&1 || true
-    systemctl disable --now crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+fail2ban_installed() { command -v fail2ban-client >/dev/null 2>&1; }
+fail2ban_running()   { systemctl is-active --quiet fail2ban 2>/dev/null; }
+
+fail2ban_detect_banaction() {
+  if command -v nft >/dev/null 2>&1 \
+     && [[ -f /etc/fail2ban/action.d/nftables-multiport.conf ]]; then
+    printf '%s\n' "nftables"
+  else
+    printf '%s\n' "iptables"
   fi
+}
+
+fail2ban_jails() {
+  fail2ban-client status 2>/dev/null \
+    | sed -nE 's/.*Jail list:[[:space:]]*//p' \
+    | tr ',' '\n' \
+    | sed -E 's/^[[:space:]]+|[[:space:]]+$//g; /^[[:space:]]*$/d'
+}
+
+fail2ban_restore_config() {
+  local target_backup="${1:-}" legacy_disabled="${2:-}"
+
+  if [[ -n "$target_backup" && -f "$target_backup" ]]; then
+    cp "$target_backup" "$FAIL2BAN_JAIL"
+  else
+    rm -f -- "$FAIL2BAN_JAIL"
+  fi
+  if [[ -n "$legacy_disabled" && -f "$legacy_disabled" ]]; then
+    mv "$legacy_disabled" /etc/fail2ban/jail.local
+  fi
+}
+
+sec_install_fail2ban() {
+  msg_section "Fail2ban — protección local contra fuerza bruta"
+
+  msg_info "Se protegerá SSH y, cuando existan logs, la autenticación y bots de Nginx."
+  msg_info "Los eventos y bloqueos permanecen en el servidor."
+  prompt_yes_no "¿Instalar o reforzar Fail2ban?" "s"
+  [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado."; return 0; }
 
   if ! dpkg -s fail2ban >/dev/null 2>&1; then
-    msg_info "Instalando fail2ban..."
+    msg_info "Instalando Fail2ban desde los repositorios del sistema..."
     apt-get install -y fail2ban
   else
-    msg_ok "fail2ban ya está instalado."
+    msg_ok "Fail2ban ya está instalado."
   fi
 
-  local jail_local="/etc/fail2ban/jail.local"
-  [[ -f "$jail_local" ]] && cp "$jail_local" "${jail_local}.bak.$(date +%F-%H%M%S)"
+  install -d -m 0755 /etc/fail2ban/jail.d
 
-  local ssh_port; ssh_port="$(_detect_ssh_port)"
+  local ssh_port firewall_backend banaction banaction_allports nginx_enabled="false"
+  local nginx_proxy_guard="n"
+  local stamp config_tmp target_backup="" legacy_disabled=""
+  ssh_port="$(_detect_ssh_port)"
+  firewall_backend="$(fail2ban_detect_banaction)"
+  banaction="${firewall_backend}-multiport"
+  banaction_allports="${firewall_backend}-allports"
+  stamp="$(date +%F-%H%M%S)"
+  config_tmp="$(mktemp)"
 
-  cat > "$jail_local" <<EOF
+  if command -v nginx >/dev/null 2>&1 \
+     && find /var/log/nginx -maxdepth 1 -type f \
+          \( -name '*access.log' -o -name '*error.log' \) -print -quit 2>/dev/null \
+          | grep -q .; then
+    nginx_enabled="true"
+  fi
+  if [[ "$nginx_enabled" == "true" ]] && command -v cloudflared >/dev/null 2>&1; then
+    if ! grep -RqsE '^[[:space:]]*real_ip_header[[:space:]]+CF-Connecting-IP;' /etc/nginx \
+       || ! grep -RqsE '^[[:space:]]*set_real_ip_from[[:space:]]+' /etc/nginx; then
+      nginx_enabled="false"
+      nginx_proxy_guard="s"
+    fi
+  fi
+
+  cat > "$config_tmp" <<EOF
 # Generado por DevLab Manager — $(date +%F)
+# No editar jail.conf: los cambios locales viven en este archivo.
 [DEFAULT]
-bantime  = 1h
-findtime = 10m
-maxretry = 5
-ignoreip = 127.0.0.1/8 ::1
-backend  = systemd
+ignoreip           = 127.0.0.1/8 ::1
+usedns             = no
+backend             = auto
+banaction           = ${banaction}
+banaction_allports  = ${banaction_allports}
+bantime             = 1h
+findtime            = 10m
+maxretry            = 5
+bantime.increment   = true
+bantime.factor      = 2
+bantime.maxtime     = 1w
 
 [sshd]
-enabled = true
-port    = ${ssh_port}
+enabled  = true
+backend  = systemd
+port     = ${ssh_port}
+mode     = normal
 maxretry = 4
 
 [nginx-http-auth]
-enabled  = true
+enabled  = ${nginx_enabled}
+backend  = polling
 port     = http,https
 logpath  = /var/log/nginx/*error.log
+maxretry = 5
 
 [nginx-botsearch]
-enabled  = true
+enabled  = ${nginx_enabled}
+backend  = polling
 port     = http,https
 logpath  = /var/log/nginx/*access.log
 maxretry = 10
 EOF
 
-  systemctl enable --now fail2ban >/dev/null 2>&1
-  systemctl restart fail2ban
-
-  sleep 1
-  echo
-  msg_ok "fail2ban activo con jails: sshd, nginx-http-auth, nginx-botsearch"
-  echo
-  msg_info "Política: 5 intentos fallidos en 10 min → baneo de 1 hora."
-  echo
-  fail2ban-client status 2>/dev/null | sed 's/^/    /' || true
-  echo
-  msg_info "Comandos útiles:"
-  echo "      fail2ban-client status sshd            # ver IPs baneadas"
-  echo "      fail2ban-client set sshd unbanip <IP>  # desbanear"
-}
-
-crowdsec_installed() { command -v cscli >/dev/null 2>&1; }
-crowdsec_running()   { systemctl is-active --quiet crowdsec 2>/dev/null; }
-
-crowdsec_bouncer_running() {
-  systemctl is-active --quiet crowdsec-firewall-bouncer 2>/dev/null
-}
-
-sec_install_crowdsec() {
-  msg_section "CrowdSec — detección colaborativa y bloqueo en firewall"
-
-  if systemctl is-active --quiet fail2ban 2>/dev/null; then
-    msg_warn "Fail2ban está activo. Se recomienda usar un solo motor de decisiones por VPS."
-    prompt_yes_no "¿Deshabilitar Fail2ban y usar CrowdSec?" "n"
-    [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Instalación cancelada; Fail2ban permanece activo."; return 0; }
-    systemctl disable --now fail2ban >/dev/null 2>&1 || true
+  if [[ -f "$FAIL2BAN_JAIL" ]]; then
+    target_backup="${FAIL2BAN_JAIL}.bak.${stamp}"
+    cp "$FAIL2BAN_JAIL" "$target_backup"
   fi
 
-  echo
-  msg_info "Se instalarán el motor CrowdSec, las colecciones Linux/Nginx y el bouncer de firewall."
-  msg_info "Los logs permanecen locales; CrowdSec comparte señales de ataque, no el contenido completo del log."
-  prompt_yes_no "¿Continuar con la instalación oficial de CrowdSec?" "s"
-  [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado."; return 0; }
+  # Versiones anteriores escribían jail.local completo. Solo se aparta cuando
+  # lleva nuestra marca; nunca se toca una configuración creada por el operador.
+  if [[ -f /etc/fail2ban/jail.local ]] \
+     && grep -q '^# Generado por DevLab Manager' /etc/fail2ban/jail.local; then
+    legacy_disabled="/etc/fail2ban/jail.local.disabled.${stamp}"
+    mv /etc/fail2ban/jail.local "$legacy_disabled"
+  fi
 
-  apt-get install -y ca-certificates curl gnupg
-  install -d -m 0755 /etc/apt/keyrings /etc/apt/sources.list.d
+  install -m 0644 "$config_tmp" "$FAIL2BAN_JAIL"
+  rm -f -- "$config_tmp"
 
-  local key_tmp
-  key_tmp="$(mktemp)"
-  if ! curl --fail --silent --show-error --location \
-      https://packagecloud.io/crowdsec/crowdsec/gpgkey --output "$key_tmp"; then
-    rm -f "$key_tmp"
-    msg_error "No se pudo descargar la clave oficial de CrowdSec."
+  if ! fail2ban-client -t; then
+    msg_error "La configuración propuesta no supera fail2ban-client -t."
+    fail2ban_restore_config "$target_backup" "$legacy_disabled"
     return 1
   fi
-  if ! gpg --batch --yes --dearmor --output "$CROWDSEC_KEYRING" "$key_tmp"; then
-    rm -f "$key_tmp"
-    msg_error "No se pudo validar/convertir la clave del repositorio CrowdSec."
-    return 1
-  fi
-  rm -f "$key_tmp"
-  chmod 0644 "$CROWDSEC_KEYRING"
 
-  cat > "$CROWDSEC_SOURCE" <<EOF
-deb [signed-by=${CROWDSEC_KEYRING}] https://packagecloud.io/crowdsec/crowdsec/any any main
-EOF
-  chmod 0644 "$CROWDSEC_SOURCE"
-  apt-get update
-
-  local bouncer_pkg="crowdsec-firewall-bouncer-iptables"
-  if iptables -V 2>/dev/null | grep -q 'nf_tables' \
-     || { ! command -v iptables >/dev/null 2>&1 && command -v nft >/dev/null 2>&1; }; then
-    bouncer_pkg="crowdsec-firewall-bouncer-nftables"
-  fi
-  msg_info "Backend detectado: ${bouncer_pkg}"
-  apt-get install -y crowdsec "$bouncer_pkg"
-
-  cscli hub update >/dev/null 2>&1 || true
-  cscli collections install crowdsecurity/linux
-  cscli collections install crowdsecurity/nginx
-
-  install -d -m 0755 /etc/crowdsec/acquis.d
-  cat > "$CROWDSEC_ACQUIS" <<'EOF'
-filenames:
-  - /var/log/nginx/*.log
-labels:
-  type: nginx
-EOF
-  chmod 0644 "$CROWDSEC_ACQUIS"
-
-  systemctl enable --now crowdsec
-  systemctl restart crowdsec
-  systemctl enable --now crowdsec-firewall-bouncer
-  systemctl restart crowdsec-firewall-bouncer
-
-  if ! crowdsec_running || ! crowdsec_bouncer_running; then
-    msg_error "CrowdSec o su bouncer no quedaron activos. Revisa journalctl -u crowdsec."
+  systemctl enable fail2ban >/dev/null 2>&1 || true
+  if ! systemctl restart fail2ban || ! fail2ban_running; then
+    msg_error "Fail2ban no quedó activo; se restaurará la configuración anterior."
+    fail2ban_restore_config "$target_backup" "$legacy_disabled"
+    systemctl restart fail2ban >/dev/null 2>&1 || true
     return 1
   fi
 
   echo
-  msg_ok "CrowdSec activo con colecciones Linux/Nginx y bloqueo en firewall."
-  msg_info "Las decisiones pueden tardar unos minutos en aparecer si aún no hay ataques."
-  sec_crowdsec_status
+  msg_ok "Fail2ban activo con acción ${firewall_backend} y SSH en puerto ${ssh_port}."
+  if [[ "$nginx_enabled" == "true" ]]; then
+    msg_ok "Jails Nginx activos: nginx-http-auth y nginx-botsearch."
+  elif [[ "$nginx_proxy_guard" == "s" ]]; then
+    msg_warn "Jails Nginx desactivados: Cloudflare está instalado y no se verificó la IP real."
+    msg_info "Configura real_ip_header y set_real_ip_from solo con redes oficiales; luego repite esta opción."
+  else
+    msg_warn "Jails Nginx desactivados porque todavía no existen logs compatibles."
+    msg_info "Vuelve a ejecutar esta opción después de instalar y arrancar Nginx."
+  fi
+  [[ -n "$legacy_disabled" ]] \
+    && msg_info "Configuración antigua preservada en: ${legacy_disabled}"
+  echo
+  sec_fail2ban_status
 }
 
-sec_crowdsec_status() {
-  msg_section "Estado de CrowdSec"
-  if ! crowdsec_installed; then
-    msg_warn "CrowdSec no está instalado."
+_fail2ban_guard() {
+  if ! fail2ban_installed; then
+    msg_warn "Fail2ban no está instalado. Usa Seguridad → 8."
+    return 1
+  fi
+  if ! fail2ban_running; then
+    msg_warn "Fail2ban está instalado pero inactivo."
+    return 1
+  fi
+}
+
+sec_fail2ban_status() {
+  msg_section "Estado de Fail2ban"
+  if ! fail2ban_installed; then
+    msg_warn "Fail2ban no está instalado."
     return 0
   fi
 
-  crowdsec_running \
-    && msg_ok "Motor crowdsec: activo" \
-    || msg_error "Motor crowdsec: inactivo"
-  crowdsec_bouncer_running \
-    && msg_ok "Firewall bouncer: activo" \
-    || msg_error "Firewall bouncer: inactivo"
+  if fail2ban_running; then
+    msg_ok "Servicio fail2ban: activo"
+  else
+    msg_error "Servicio fail2ban: inactivo"
+    journalctl -u fail2ban -n 20 --no-pager 2>/dev/null | sed 's/^/      /' || true
+    return 1
+  fi
+
   echo
-  msg_info "Bouncers registrados:"
-  cscli bouncers list 2>/dev/null | sed 's/^/    /' || true
-  echo
-  msg_info "Decisiones activas:"
-  cscli decisions list 2>/dev/null | sed 's/^/    /' || true
-  echo
-  msg_info "Métricas de adquisición y parsers:"
-  cscli metrics 2>/dev/null | sed 's/^/    /' || true
+  fail2ban-client status 2>/dev/null | sed 's/^/    /'
+  local jail
+  while IFS= read -r jail; do
+    [[ -n "$jail" ]] || continue
+    echo
+    msg_info "Jail: ${jail}"
+    fail2ban-client status "$jail" 2>/dev/null | sed 's/^/      /' || true
+  done < <(fail2ban_jails)
 }
 
-sec_select_intrusion_engine() {
-  msg_section "Protección anti-intrusión"
-  echo "  1) CrowdSec  (recomendado: inteligencia colaborativa + firewall bouncer)"
-  echo "  2) Fail2ban  (alternativa clásica y completamente local)"
-  echo "  0) Omitir"
+fail2ban_test_config() {
+  msg_section "Validar configuración de Fail2ban"
+  if fail2ban-client -t; then
+    msg_ok "Configuración válida."
+  else
+    msg_error "Configuración inválida; no reinicies el servicio hasta corregirla."
+    return 1
+  fi
+}
+
+fail2ban_choose_jail() {
+  _fail2ban_guard || return 1
   echo
+  msg_info "Jails disponibles:"
+  fail2ban_jails | sed 's/^/      - /'
+  echo
+  read -rp "  Jail: " SELECTED_JAIL
+  [[ "$SELECTED_JAIL" =~ ^[A-Za-z0-9_.-]+$ ]] \
+    || { msg_error "Nombre de jail inválido."; return 1; }
+  fail2ban-client status "$SELECTED_JAIL" >/dev/null 2>&1 \
+    || { msg_error "El jail '${SELECTED_JAIL}' no existe o no está activo."; return 1; }
+}
+
+fail2ban_show_jail() {
+  fail2ban_choose_jail || return 1
+  echo
+  fail2ban-client status "$SELECTED_JAIL" | sed 's/^/    /'
+}
+
+fail2ban_ban_ip() {
+  fail2ban_choose_jail || return 1
+  local ip
+  read -rp "  IPv4 a bloquear: " ip
+  valid_ip "$ip" || { msg_error "IPv4 inválida."; return 1; }
+  if fail2ban-client set "$SELECTED_JAIL" banip "$ip" >/dev/null; then
+    msg_ok "${ip} bloqueada en ${SELECTED_JAIL}."
+  else
+    msg_error "No se pudo aplicar el bloqueo."
+    return 1
+  fi
+}
+
+fail2ban_unban_ip() {
+  fail2ban_choose_jail || return 1
+  local ip
+  read -rp "  IPv4 a desbloquear: " ip
+  valid_ip "$ip" || { msg_error "IPv4 inválida."; return 1; }
+  if fail2ban-client set "$SELECTED_JAIL" unbanip "$ip" >/dev/null; then
+    msg_ok "${ip} desbloqueada en ${SELECTED_JAIL}."
+  else
+    msg_error "La IP no estaba bloqueada en ese jail o no pudo eliminarse."
+    return 1
+  fi
+}
+
+fail2ban_live_logs() {
+  msg_section "Logs de Fail2ban en vivo"
+  msg_info "Pulsa Ctrl+C para volver."
+  echo
+  trap ':' INT
+  journalctl -u fail2ban -n 40 -f 2>/dev/null || true
+  trap on_interrupt INT
+}
+
+header_fail2ban() {
+  clear
+  echo -e "${BOLD}${RED}╔═══════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${RED}║${WHITE}  Fail2ban — Consola de operación           ${RED}║${RESET}"
+  echo -e "${BOLD}${RED}╚═══════════════════════════════════════════╝${RESET}"
+}
+
+menu_fail2ban() {
   local opt
-  read -rp "  Opción [1]: " opt
-  opt="${opt:-1}"
-  case "$opt" in
-    1) sec_install_crowdsec ;;
-    2) sec_install_fail2ban ;;
-    0) msg_warn "Protección anti-intrusión omitida." ;;
-    *) msg_error "Opción inválida."; return 1 ;;
-  esac
+  while true; do
+    clear
+    header_fail2ban
+    echo
+    if fail2ban_running; then
+      msg_ok "Servicio activo"
+    elif fail2ban_installed; then
+      msg_warn "Instalado, pero inactivo"
+    else
+      msg_warn "No instalado (usa la opción 8)"
+    fi
+    echo
+    echo -e "  ${RED}1)${RESET} Estado general y jails"
+    echo -e "  ${RED}2)${RESET} Inspeccionar un jail"
+    echo -e "  ${RED}3)${RESET} Validar configuración"
+    echo -e "  ${RED}4)${RESET} Bloquear una IPv4 manualmente"
+    echo -e "  ${RED}5)${RESET} Desbloquear una IPv4"
+    echo -e "  ${RED}6)${RESET} Logs en vivo"
+    echo
+    echo -e "  ${RED}0)${RESET} ← Volver al menú de seguridad"
+    echo
+    read -rp "  Opción: " opt
+    case "$opt" in
+      1) run_item header_fail2ban sec_fail2ban_status ;;
+      2) run_item header_fail2ban fail2ban_show_jail ;;
+      3) run_item header_fail2ban fail2ban_test_config ;;
+      4) run_item header_fail2ban fail2ban_ban_ip ;;
+      5) run_item header_fail2ban fail2ban_unban_ip ;;
+      6) run_item header_fail2ban fail2ban_live_logs ;;
+      0) return ;;
+      *) msg_error "Opción inválida."; pause ;;
+    esac
+  done
 }
 
 sec_harden_ssh() {
@@ -3349,27 +3746,28 @@ sec_change_ssh_port() {
     break
   done
 
-  # Detectar de antemano posibles causas de que el cambio "no pegue"
+  # Detectar de antemano el modo de activación y mostrar las fuentes existentes.
   local conf_dir="/etc/ssh/sshd_config.d"
-  local conflicting=()
-  [[ -d "$conf_dir" ]] && mapfile -t conflicting < <(grep -lE '^[[:space:]]*Port[[:space:]]' "${conf_dir}"/*.conf 2>/dev/null)
+  local include_port_lines=()
+  [[ -d "$conf_dir" ]] && mapfile -t include_port_lines < <(
+    grep -HnE '^[[:space:]]*Port[[:space:]]+[0-9]+' "${conf_dir}"/*.conf 2>/dev/null || true
+  )
   local socket_will_interfere="n"
   _ssh_socket_active && socket_will_interfere="s"
 
   echo
   msg_warn "Pasos que se aplicarán:"
   echo "      1. Permitir ${new_port}/tcp en UFW (si está activo) ANTES del cambio"
-  echo "      2. Cambiar Port en sshd_config y reiniciar SSH"
+  echo "      2. Crear un drop-in administrado y validar la configuración efectiva"
   echo "      3. Actualizar el puerto en fail2ban (si está instalado)"
   echo "      4. Verificar que sshd quede escuchando REALMENTE en ${new_port} (no solo la config)"
   echo "      5. La regla UFW del puerto antiguo (${old_port}) se elimina SOLO cuando confirmes"
   echo "         que ya probaste la conexión nueva."
   echo
 
-  if [[ "${#conflicting[@]}" -gt 0 ]]; then
-    msg_error "AVISO: ${conf_dir} tiene archivos que declaran su propio Port:"
-    local f; for f in "${conflicting[@]}"; do echo "      ${f}"; done
-    msg_error "Esto puede pisar el Port que vas a fijar. Se comentarán automáticamente."
+  if [[ "${#include_port_lines[@]}" -gt 0 ]]; then
+    msg_info "Declaraciones Port existentes (se conservarán sin modificaciones):"
+    local entry; for entry in "${include_port_lines[@]}"; do echo "      ${entry}"; done
     echo
   fi
   if [[ "$socket_will_interfere" == "s" ]]; then
@@ -3387,21 +3785,39 @@ sec_change_ssh_port() {
     msg_ok "UFW: ${new_port}/tcp permitido."
   fi
 
-  # 2) sshd_config
-  cp "$sshd" "${sshd}.bak.$(date +%F-%H%M%S)"
-  if grep -qE "^[#[:space:]]*Port[[:space:]]" "$sshd"; then
-    sed -i "0,/^[#[:space:]]*Port[[:space:]].*/s//Port ${new_port}/" "$sshd"
-  else
-    echo "Port ${new_port}" >> "$sshd"
+  # 2) Drop-in propio: no se modifican archivos gestionados por el proveedor.
+  install -d -m 0755 "$conf_dir"
+  local managed_port_file="${conf_dir}/00-devlab-port.conf"
+  local managed_port_backup="" managed_port_preexisting="n"
+  if [[ -f "$managed_port_file" ]]; then
+    managed_port_preexisting="s"
+    managed_port_backup="${managed_port_file}.bak.$(date +%F-%H%M%S)"
+    cp "$managed_port_file" "$managed_port_backup"
   fi
+  printf '# Gestionado por DevLab Manager\nPort %s\n' "$new_port" > "$managed_port_file"
+  chmod 0644 "$managed_port_file"
 
-  # 2b) Neutralizar Port en Include que pisaría lo anterior
-  local f
-  for f in "${conflicting[@]}"; do
-    cp "$f" "${f}.bak.$(date +%F-%H%M%S)"
-    sed -i -E "s/^([[:space:]]*Port[[:space:]].*)/# \1  # comentado por DevLab Manager (conflicto de puerto)/" "$f"
-    msg_ok "Comentado 'Port' en: ${f}"
-  done
+  local effective_after
+  if ! sshd -t 2>/dev/null; then
+    if [[ "$managed_port_preexisting" == "s" ]]; then
+      cp "$managed_port_backup" "$managed_port_file"
+    else
+      rm -f -- "$managed_port_file"
+    fi
+    msg_error "El drop-in produjo una configuración inválida; se restauró el estado anterior."
+    return 1
+  fi
+  effective_after="$(_detect_ssh_port)"
+  if [[ "$effective_after" != "$new_port" ]]; then
+    if [[ "$managed_port_preexisting" == "s" ]]; then
+      cp "$managed_port_backup" "$managed_port_file"
+    else
+      rm -f -- "$managed_port_file"
+    fi
+    msg_error "El puerto efectivo sigue siendo ${effective_after}; otro ajuste anterior tiene prioridad."
+    msg_info "No se modificaron las declaraciones existentes. Revisa: sshd -T | grep -i '^port'"
+    return 1
+  fi
 
   # 2c) Deshabilitar socket activation si está presente
   if [[ "$socket_will_interfere" == "s" ]]; then
@@ -3410,12 +3826,18 @@ sec_change_ssh_port() {
     msg_ok "ssh.socket detenido y deshabilitado."
   fi
 
-  if ! sshd -t 2>/dev/null; then
-    msg_error "sshd_config inválido. Restaurando backup..."
-    cp "$(ls -t "${sshd}.bak."* | head -1)" "$sshd" 2>/dev/null || true
+  if ! { systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null; }; then
+    if [[ "$managed_port_preexisting" == "s" ]]; then
+      cp "$managed_port_backup" "$managed_port_file"
+    else
+      rm -f -- "$managed_port_file"
+    fi
+    [[ "$socket_will_interfere" == "s" ]] \
+      && systemctl enable --now ssh.socket >/dev/null 2>&1 || true
+    systemctl restart ssh >/dev/null 2>&1 || systemctl restart sshd >/dev/null 2>&1 || true
+    msg_error "No se pudo reiniciar SSH; se restauró el puerto anterior."
     return 1
   fi
-  systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
   sleep 1
 
   # 3) Verificación REAL — no basta con "sshd -t" ni con confiar en el archivo
@@ -3423,19 +3845,34 @@ sec_change_ssh_port() {
   if [[ ",${listen_port}," != *",${new_port},"* ]]; then
     msg_error "sshd NO quedó escuchando en ${new_port} (escucha en: ${listen_port:-nada})."
     msg_error "Restaurando el puerto anterior para no perder el acceso..."
-    cp "$(ls -t "${sshd}.bak."* | head -1)" "$sshd" 2>/dev/null || true
-    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
+    if [[ "$managed_port_preexisting" == "s" ]]; then
+      cp "$managed_port_backup" "$managed_port_file"
+    else
+      rm -f -- "$managed_port_file"
+    fi
+    [[ "$socket_will_interfere" == "s" ]] \
+      && systemctl enable --now ssh.socket >/dev/null 2>&1 || true
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
     msg_warn "Revertido a puerto ${old_port}. Ejecuta el diagnóstico:"
     echo "      Seguridad → Diagnosticar y reparar puerto SSH"
     return 1
   fi
   msg_ok "SSH verificado escuchando en el puerto ${new_port} (config + socket coinciden)."
 
-  # 4) fail2ban
-  if [[ -f /etc/fail2ban/jail.local ]]; then
-    sed -i "s/^port    = .*/port    = ${new_port}/" /etc/fail2ban/jail.local
-    systemctl restart fail2ban 2>/dev/null || true
-    msg_ok "fail2ban actualizado al puerto ${new_port}."
+  # 4) Fail2ban: validar y revertir de forma independiente si falla.
+  if [[ -f "$FAIL2BAN_JAIL" ]]; then
+    local fail2ban_backup="${FAIL2BAN_JAIL}.bak.$(date +%F-%H%M%S)"
+    cp "$FAIL2BAN_JAIL" "$fail2ban_backup"
+    sed -i -E "/^\[sshd\]/,/^\[/{s/^[[:space:]]*port[[:space:]]*=.*/port     = ${new_port}/;}" \
+      "$FAIL2BAN_JAIL"
+    if fail2ban-client -t >/dev/null 2>&1 && systemctl restart fail2ban; then
+      msg_ok "Fail2ban actualizado al puerto ${new_port}."
+    else
+      cp "$fail2ban_backup" "$FAIL2BAN_JAIL"
+      systemctl restart fail2ban >/dev/null 2>&1 || true
+      msg_error "No se pudo actualizar Fail2ban; se restauró su configuración anterior."
+      return 1
+    fi
   fi
 
   echo
@@ -3744,20 +4181,14 @@ sec_audit() {
   else
     _chk "UFW firewall" warn "inactivo o no instalado (Seguridad → 7)"
   fi
-  local crowdsec_active="n" fail2ban_active="n"
-  crowdsec_running && crowdsec_active="s"
-  systemctl is-active --quiet fail2ban 2>/dev/null && fail2ban_active="s"
-  if [[ "$crowdsec_active" == "s" && "$fail2ban_active" == "s" ]]; then
-    _chk "Motor anti-intrusión" warn "CrowdSec y Fail2ban activos a la vez; selecciona solo uno (Seguridad → 8)"
-  elif [[ "$crowdsec_active" == "s" ]]; then
-    _chk "CrowdSec" ok "motor activo"
-    crowdsec_bouncer_running \
-      && _chk "CrowdSec firewall bouncer" ok "activo" \
-      || _chk "CrowdSec firewall bouncer" warn "inactivo; no se aplicarán bloqueos"
-  elif [[ "$fail2ban_active" == "s" ]]; then
-    _chk "Fail2ban" ok "activo"
+  if fail2ban_running; then
+    if fail2ban-client status sshd >/dev/null 2>&1; then
+      _chk "Fail2ban" ok "activo; jail sshd operativo"
+    else
+      _chk "Fail2ban" warn "activo, pero el jail sshd no está operativo"
+    fi
   else
-    _chk "Motor anti-intrusión" warn "CrowdSec/Fail2ban inactivo o no instalado (Seguridad → 8)"
+    _chk "Fail2ban" warn "inactivo o no instalado (Seguridad → 8)"
   fi
 
   echo; echo -e "  ${BOLD}── SSH ──${RESET}"
@@ -3820,6 +4251,21 @@ sec_audit() {
   done < <(find /var/www -mindepth 1 -maxdepth 1 -type d -user www-data 2>/dev/null)
   [[ $bad_owner -eq 0 ]] && _chk "Propietario del código" ok "raíces de sitio no pertenecen a www-data"
 
+  local isolation_bad=0 site_dir site runtime_user pool_file site_conf expected_socket
+  while IFS= read -r site_dir; do
+    site="${site_dir##*/}"
+    runtime_user="$(site_runtime_user "$site")"
+    pool_file="/etc/php/${PHP_VERSION}/fpm/pool.d/${DEVLAB_POOL_PREFIX}${site}.conf"
+    site_conf="/etc/nginx/sites-available/${site}"
+    expected_socket="/run/php/${DEVLAB_POOL_PREFIX}${site}.sock"
+    if ! id "$runtime_user" >/dev/null 2>&1 || [[ ! -f "$pool_file" ]] \
+       || ! grep -Fq "fastcgi_pass unix:${expected_socket};" "$site_conf" 2>/dev/null; then
+      _chk "Aislamiento PHP por sitio" warn "${site}: usuario/pool/socket dedicado incompleto"
+      isolation_bad=1
+    fi
+  done < <(find /var/www -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+  [[ $isolation_bad -eq 0 ]] && _chk "Aislamiento PHP por sitio" ok "usuarios, pools y sockets dedicados"
+
   local upload_php=0
   while IFS= read -r f; do
     _chk "PHP dentro de uploads" warn "$f"
@@ -3852,6 +4298,15 @@ sec_audit() {
     _chk "MySQL / MariaDB" ok "no instalado en este LXC"
   fi
 
+  local backup_dir backup_mode
+  backup_dir="$(db_backup_dir)"
+  if [[ -d "$backup_dir" ]]; then
+    backup_mode="$(stat -c '%a' "$backup_dir" 2>/dev/null || echo '?')"
+    [[ "$backup_mode" == "700" ]] \
+      && _chk "Directorio de backups SQL" ok "${backup_dir} (700)" \
+      || _chk "Directorio de backups SQL" warn "${backup_dir} (${backup_mode}; esperado 700)"
+  fi
+
   echo; echo -e "  ${BOLD}── Sistema ──${RESET}"
   dpkg -s unattended-upgrades >/dev/null 2>&1 \
     && _chk "Actualizaciones automáticas" ok "habilitadas" \
@@ -3869,6 +4324,7 @@ sec_audit() {
     echo -e "  ${BOLD}${GREEN}╚══════════════════════════════════════════╝${RESET}"
   else
     msg_warn "Auditoría completada: ${warn_count} punto(s) por corregir (indicados arriba)."
+    return 1
   fi
 }
 
@@ -3878,7 +4334,7 @@ sec_harden_all() {
   echo
   echo "    1. Diagnóstico de puerto SSH (socket activation / Include)"
   echo "    2. Firewall UFW"
-  echo "    3. CrowdSec o Fail2ban (seleccionable)"
+  echo "    3. Fail2ban con protección SSH y Nginx"
   echo "    4. Endurecer SSH"
   echo "    5. Headers de seguridad Nginx"
   echo "    6. Actualizaciones de seguridad automáticas"
@@ -3887,13 +4343,31 @@ sec_harden_all() {
   prompt_yes_no "¿Comenzar el blindaje completo?" "s"
   [[ "$REPLY_YESNO" != "s" ]] && { msg_warn "Cancelado."; return 0; }
 
-  echo; sec_ssh_diagnose      || true
-  echo; sec_install_ufw       || true
-  echo; sec_select_intrusion_engine || true
-  echo; sec_harden_ssh        || true
-  echo; sec_nginx_headers     || true
-  echo; sec_auto_updates      || true
-  echo; sec_audit             || true
+  local failures=0
+  _hardening_step() {
+    local label="$1"; shift
+    echo
+    if "$@"; then
+      msg_ok "Etapa completada: ${label}"
+    else
+      msg_error "Etapa fallida: ${label}"
+      ((failures++)) || true
+    fi
+  }
+
+  _hardening_step "Diagnóstico SSH" sec_ssh_diagnose
+  _hardening_step "Firewall UFW" sec_install_ufw
+  _hardening_step "Fail2ban" sec_install_fail2ban
+  _hardening_step "Endurecimiento SSH" sec_harden_ssh
+  _hardening_step "Headers Nginx" sec_nginx_headers
+  _hardening_step "Actualizaciones automáticas" sec_auto_updates
+  _hardening_step "Auditoría final" sec_audit
+
+  if (( failures > 0 )); then
+    msg_error "Blindaje incompleto: ${failures} etapa(s) requieren intervención."
+    return 1
+  fi
+  msg_ok "Blindaje completado sin etapas fallidas."
 }
 
 header_seguridad() {
@@ -3908,7 +4382,7 @@ menu_seguridad() {
     clear
     header_seguridad; echo
     menu_cat "Acción rápida" "$RED"
-    echo -e "  ${RED}1)${RESET} ${BOLD}Blindaje completo${RESET}  (firewall + CrowdSec/Fail2ban + SSH + Nginx + updates + auditoría)"
+    echo -e "  ${RED}1)${RESET} ${BOLD}Blindaje completo${RESET}  (firewall + Fail2ban + SSH + Nginx + updates + auditoría)"
     menu_cat "Acceso SSH (prioridad alta)" "$RED"
     echo -e "  ${RED}2)${RESET} Endurecer SSH  (root sin password, límites de intentos)"
     echo -e "  ${RED}3)${RESET} Acceso por clave SSH desde tu Mac  (autorizar clave + guía)"
@@ -3917,8 +4391,8 @@ menu_seguridad() {
     echo -e "  ${RED}6)${RESET} Diagnosticar y reparar puerto SSH  (socket activation / Include)"
     menu_cat "Red y fuerza bruta" "$RED"
     echo -e "  ${RED}7)${RESET} Firewall UFW  (deny incoming + SSH/HTTP/HTTPS)"
-    echo -e "  ${RED}8)${RESET} Protección anti-intrusión  (CrowdSec recomendado / Fail2ban)"
-    echo -e "  ${RED}9)${RESET} Estado de CrowdSec  (bouncer, decisiones y métricas)"
+    echo -e "  ${RED}8)${RESET} Instalar o reforzar Fail2ban  (SSH + Nginx)"
+    echo -e "  ${RED}9)${RESET} Consola de Fail2ban  (jails, bans, validación y logs)"
     menu_cat "Web y sistema" "$RED"
     echo -e "  ${RED}10)${RESET} Headers de seguridad Nginx  (+ ocultar versión)"
     echo -e "  ${RED}11)${RESET} Actualizaciones de seguridad automáticas"
@@ -3936,8 +4410,8 @@ menu_seguridad() {
       5)  run_item header_seguridad sec_change_ssh_port ;;
       6)  run_item header_seguridad sec_ssh_diagnose ;;
       7)  run_item header_seguridad sec_install_ufw ;;
-      8)  run_item header_seguridad sec_select_intrusion_engine ;;
-      9)  run_item header_seguridad sec_crowdsec_status ;;
+      8)  run_item header_seguridad sec_install_fail2ban ;;
+      9)  menu_fail2ban ;;
       10) run_item header_seguridad sec_nginx_headers ;;
       11) run_item header_seguridad sec_auto_updates ;;
       12) run_item header_seguridad sec_audit ;;
@@ -4071,13 +4545,9 @@ _mon_render() {
   local db_dot="${RED}●${RESET}" db_svc
   db_svc="$(db_service)"
   [[ -n "$db_svc" ]] && db_dot="$(_dot "$db_svc")"
-  local intrusion_dot intrusion_name
-  if crowdsec_running; then
-    intrusion_dot="$(_dot crowdsec)"; intrusion_name="CrowdSec"
-  else
-    intrusion_dot="$(_dot fail2ban)"; intrusion_name="Fail2ban"
-  fi
-  echo -e "  ${BOLD}Servicios${RESET}   Nginx $(_dot nginx)   PHP-FPM ${php_dot}   $(db_label) ${db_dot}   Cloudflared $(_dot cloudflared)   ${intrusion_name} ${intrusion_dot}   UFW ${ufw_dot}"
+  local intrusion_dot
+  intrusion_dot="$(_dot fail2ban)"
+  echo -e "  ${BOLD}Servicios${RESET}   Nginx $(_dot nginx)   PHP-FPM ${php_dot}   $(db_label) ${db_dot}   Cloudflared $(_dot cloudflared)   Fail2ban ${intrusion_dot}   UFW ${ufw_dot}"
   echo -e "  ${DIM}Conexiones TCP: ${nconn}    Procesos PHP: ${nphp}    Conexiones DB: ${ndb}${RESET}"
   echo
 
@@ -4495,12 +4965,8 @@ show_system_status() {
   printf "  %-28s %b\n" "cloudflared:" "$cf_status_s"
 
   local intrusion_status
-  if crowdsec_running && crowdsec_bouncer_running; then
-    intrusion_status="${GREEN}CrowdSec + bouncer activos${RESET}"
-  elif systemctl is-active --quiet fail2ban 2>/dev/null; then
+  if fail2ban_running; then
     intrusion_status="${GREEN}Fail2ban activo${RESET}"
-  elif crowdsec_running; then
-    intrusion_status="${YELLOW}CrowdSec activo / bouncer inactivo${RESET}"
   else
     intrusion_status="${YELLOW}no activo${RESET}"
   fi
@@ -4553,15 +5019,12 @@ git_show_key() {
   echo
   echo -e "${BOLD}  Dónde agregarla en GitHub (elige UNA de las dos opciones):${RESET}"
   echo
-  echo -e "  ${GREEN}★ RECOMENDADO — Clave de cuenta (sirve para TODOS tus repositorios):${RESET}"
-  echo "    GitHub → avatar → Settings → SSH and GPG keys → New SSH key"
-  echo "    Title: VPS-$(hostname)   |   Key type: Authentication Key"
-  echo
-  echo -e "  ${DIM}  Alternativa — Deploy key (solo para UN repositorio):${RESET}"
+  echo -e "  ${GREEN}★ RECOMENDADO — Deploy key de solo lectura (un repositorio):${RESET}"
   echo "    GitHub → Repositorio → Settings → Deploy keys → Add deploy key"
-  echo "    (repetir en cada repo; útil si el VPS no es tuyo)"
+  echo "    No marques 'Allow write access'. Usa una clave distinta por servidor/alcance."
   echo
-  msg_info "Con la clave de cuenta agregas una vez y todos tus repos quedan disponibles."
+  echo -e "  ${YELLOW}Evita agregar esta clave a tu cuenta personal:${RESET} daría al VPS acceso"
+  echo "  a todos los repositorios autorizados para esa cuenta."
 }
 
 git_setup_key() {
@@ -4593,9 +5056,14 @@ git_setup_key() {
   chmod 644 "${GIT_DEPLOY_KEY}.pub"
 
   local ssh_cfg="/root/.ssh/config"
+  local known_hosts="/root/.ssh/known_hosts"
   touch "$ssh_cfg"
+  touch "$known_hosts"
+  grep -Fxq "$GITHUB_ED25519_HOST_KEY" "$known_hosts" 2>/dev/null \
+    || printf '%s\n' "$GITHUB_ED25519_HOST_KEY" >> "$known_hosts"
+  chmod 600 "$known_hosts"
   # Corrige configuraciones antiguas creadas por versiones previas del script.
-  sed -i 's/StrictHostKeyChecking[[:space:]]\+no/StrictHostKeyChecking accept-new/g' "$ssh_cfg"
+  sed -i -E 's/StrictHostKeyChecking[[:space:]]+(no|accept-new)/StrictHostKeyChecking yes/g' "$ssh_cfg"
   if ! grep -q "Host github.com" "$ssh_cfg" 2>/dev/null; then
     cat >> "$ssh_cfg" <<EOF
 
@@ -4603,7 +5071,8 @@ Host github.com
     HostName github.com
     User git
     IdentityFile ${GIT_DEPLOY_KEY}
-    StrictHostKeyChecking accept-new
+    StrictHostKeyChecking yes
+    UserKnownHostsFile /root/.ssh/known_hosts
 EOF
     msg_ok "/root/.ssh/config configurado para GitHub."
   fi
@@ -4722,6 +5191,10 @@ _git_pull_dir() {
   _git_allow_directory "$site_dir"
   local branch; branch="$(git -C "$site_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'main')"
 
+  # Repara el residuo de versiones anteriores que quitaban el bit ejecutable
+  # a scripts versionados. No toca el contenido ni oculta cambios reales.
+  _git_restore_tracked_exec_modes "$site_dir"
+
   if [[ -n "$(git -C "$site_dir" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
     msg_error "Hay cambios locales en archivos versionados. Se cancela para no sobrescribirlos."
     git -C "$site_dir" status --short --untracked-files=no | sed 's/^/    /'
@@ -4798,21 +5271,46 @@ _deploy_npm() {
     && { msg_warn "package.json no encontrado en ${dir}"; return 0; }
   command -v npm >/dev/null 2>&1 \
     || { msg_warn "npm no está instalado en el servidor."; return 1; }
-  if [[ -f "${dir}/package-lock.json" ]]; then
-    msg_info "Ejecutando npm ci desde package-lock.json..."
-    npm ci --prefix "$dir" 2>&1 \
-      && msg_ok "npm ci completado." \
-      || { msg_error "npm ci falló."; return 1; }
-  else
-    msg_warn "No hay package-lock.json; se usará npm install."
-    npm install --prefix "$dir" 2>&1 \
-      && msg_ok "npm install completado." \
-      || { msg_error "npm install falló."; return 1; }
+  [[ -f "${dir}/package-lock.json" ]] || {
+    msg_error "Deploy bloqueado: package-lock.json es obligatorio en producción."
+    msg_info "Genera y revisa el lockfile en CI/desarrollo antes de desplegar."
+    return 1
+  }
+
+  local build_user="devlab-build" build_home="${DEVLAB_STATE_DIR}/build"
+  if ! id "$build_user" >/dev/null 2>&1; then
+    useradd --system --user-group --home-dir "$build_home" --create-home \
+      --shell /usr/sbin/nologin "$build_user"
   fi
-  msg_info "Ejecutando npm run build..."
-  npm run build --prefix "$dir" 2>&1 \
-    && msg_ok "npm run build completado." \
-    || { msg_error "npm run build falló."; return 1; }
+  install -d -o "$build_user" -g "$build_user" -m 0700 "$build_home"
+  command -v setfacl >/dev/null 2>&1 || {
+    msg_error "Se necesita 'acl' para conceder acceso temporal y acotado al usuario de build."
+    return 1
+  }
+
+  # Nunca se ejecutan lifecycle scripts como root. El usuario de build solo
+  # recibe escritura temporal en este repositorio y no puede leer su .env.
+  setfacl -R -m "u:${build_user}:rwX" "$dir"
+  setfacl -m "u:${build_user}:---" "${dir}/.env" 2>/dev/null || true
+
+  local rc=0
+  msg_info "Ejecutando npm ci como usuario sin privilegios (${build_user})..."
+  runuser -u "$build_user" -- env HOME="$build_home" \
+    npm ci --prefix "$dir" 2>&1 || rc=$?
+  if (( rc == 0 )); then
+    msg_info "Ejecutando npm run build como ${build_user}..."
+    runuser -u "$build_user" -- env HOME="$build_home" \
+      npm run build --prefix "$dir" 2>&1 || rc=$?
+  fi
+
+  setfacl -R -x "u:${build_user}" "$dir" 2>/dev/null || true
+  _apply_site_code_perms "$dir"
+
+  if (( rc != 0 )); then
+    msg_error "El build npm falló (código ${rc}); se restauraron los permisos."
+    return "$rc"
+  fi
+  msg_ok "Build npm completado sin ejecutar código como root."
 }
 
 git_status_site() {
@@ -4981,7 +5479,7 @@ menu_web_stack() {
     echo -e "  ${CYAN} 5)${RESET} Probar sitio"
     echo -e "  ${CYAN} 6)${RESET} Eliminar sitio"
     echo -e "  ${CYAN} 7)${RESET} Limpiar diagnósticos heredados (info.php, test-db.php)"
-    echo -e "  ${CYAN} 8)${RESET} Reparar permisos de código, storage y uploads"
+    echo -e "  ${CYAN} 8)${RESET} Migrar/reparar aislamiento (usuario + pool PHP + permisos)"
     menu_cat "Servicios y PHP" "$CYAN"
     echo -e "  ${CYAN} 9)${RESET} Recargar Nginx + PHP-FPM"
     echo -e "  ${CYAN}10)${RESET} Cambiar límite de subida de archivos"
@@ -5234,6 +5732,23 @@ menu_sistema() {
 # MENÚ PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════════════
 
+isolation_summary() {
+  local total=0 isolated=0 dir site runtime_user
+  while IFS= read -r dir; do
+    ((total++)) || true
+    site="${dir##*/}"
+    runtime_user="$(site_runtime_user "$site")"
+    if id "$runtime_user" >/dev/null 2>&1 \
+       && [[ -n "$PHP_VERSION" ]] \
+       && [[ -f "/etc/php/${PHP_VERSION}/fpm/pool.d/${DEVLAB_POOL_PREFIX}${site}.conf" ]] \
+       && grep -Fq "fastcgi_pass unix:/run/php/${DEVLAB_POOL_PREFIX}${site}.sock;" \
+            "/etc/nginx/sites-available/${site}" 2>/dev/null; then
+      ((isolated++)) || true
+    fi
+  done < <(find /var/www -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+  printf '%s/%s' "$isolated" "$total"
+}
+
 main_menu() {
   if [[ -z "$PHP_VERSION" ]]; then
     local _d=()
@@ -5265,13 +5780,24 @@ main_menu() {
       php_s="${RED}●${RESET}"
     fi
     echo -e "  Nginx ${ng_s}   PHP-FPM ${php_s}   $(db_label) ${db_s}   Cloudflared ${cf_s}"
+    local iso_summary
+    iso_summary="$(isolation_summary)"
+    if [[ "$iso_summary" == */0 || "${iso_summary%/*}" == "${iso_summary#*/}" ]]; then
+      echo -e "  ${GREEN}Aislamiento de sitios: ${iso_summary}${RESET}"
+    else
+      echo -e "  ${YELLOW}Aislamiento de sitios: ${iso_summary} — migra desde Stack Web → 8${RESET}"
+    fi
     echo
 
-    local ip_local ip_publica
+    local ip_local ip_publica="oculta"
     ip_local="$(detect_primary_ip 2>/dev/null || echo '—')"
-    ip_publica="$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || echo '—')"
+    if [[ "${DEVLAB_SHOW_PUBLIC_IP:-n}" == "s" ]]; then
+      ip_publica="$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || echo '—')"
+    fi
     printf "  ${DIM}IP local:${RESET}  ${CYAN}%-18s${RESET}  ${DIM}IP pública:${RESET}  ${CYAN}%s${RESET}\n" \
       "$ip_local" "$ip_publica"
+    [[ "${DEVLAB_SHOW_PUBLIC_IP:-n}" != "s" ]] \
+      && echo -e "  ${DIM}(privacidad: exporta DEVLAB_SHOW_PUBLIC_IP=s para consultarla)${RESET}"
     echo
 
     echo -e "  ${CYAN}1)${RESET} ${BOLD}Stack Web${RESET}      — Nginx, PHP-FPM, sitios"
@@ -5279,7 +5805,7 @@ main_menu() {
     echo -e "  ${YELLOW}3)${RESET} ${BOLD}Cloudflare${RESET}     — Tunnel, config, DNS"
     echo -e "  ${GREEN}4)${RESET} ${BOLD}Git / Deploy${RESET}   — Deploy key, clone, pull, post-deploy"
     echo -e "  ${WHITE}5)${RESET} ${BOLD}Sistema${RESET}        — Hora, zona horaria, actualizaciones"
-    echo -e "  ${RED}6)${RESET} ${BOLD}Seguridad${RESET}      — Firewall, CrowdSec/Fail2ban, SSH, auditoría"
+    echo -e "  ${RED}6)${RESET} ${BOLD}Seguridad${RESET}      — Firewall, Fail2ban, SSH, auditoría"
     echo -e "  ${GREEN}7)${RESET} ${BOLD}Monitor${RESET}        — Dashboard en vivo (CPU, RAM, red, sitios)"
     echo -e "  ${CYAN}8)${RESET} ${BOLD}Dev Tools${RESET}      — Logs, tráfico, benchmark, mantenimiento"
     echo -e "  ${WHITE}9)${RESET} ${BOLD}Estado${RESET}         — Resumen estático de servicios"

@@ -1,11 +1,11 @@
-# Auditoría técnica de DevLab Manager 2.0
+# Auditoría técnica de DevLab Manager 2.1
 
-Fecha de revisión: 2026-08-15
+Fecha de revisión: 2026-09-27
 Alcance: `produccion.sh`, documentación, flujos de instalación, sitios, SSH, Nginx, bases de datos, Git/deploy y controles anti-intrusión.
 
 ## Resumen ejecutivo
 
-La versión revisada tenía una buena base —modo estricto Bash, validaciones, `nginx -t`, backups y confirmaciones— pero conservaba varios comportamientos adecuados para laboratorio y riesgosos en producción. Los de mayor impacto se corrigieron en la versión 2.0.
+La versión revisada tenía una buena base —modo estricto Bash, validaciones, `nginx -t`, backups y confirmaciones— pero conservaba varios comportamientos adecuados para laboratorio y riesgosos en producción. Los de mayor impacto se corrigieron en la versión 2.1.
 
 ## Hallazgos corregidos
 
@@ -25,12 +25,13 @@ La versión revisada tenía una buena base —modo estricto Bash, validaciones, 
 | Alta | Algunas operaciones destructivas aceptaban nombres SQL sin validar | Bases, usuarios, hosts, grants, dump y restore usan validadores estrictos |
 | Baja | `npm install` ignoraba el lockfile como instalación reproducible | Se prefiere `npm ci` cuando existe `package-lock.json` |
 | Alta | Basic Auth pasaba la contraseña en argumentos visibles del proceso | La contraseña se entrega por entrada estándar y se limpia de memoria después |
+| Alta | El diagnóstico SSH trataba cualquier `Port` incluido como conflicto y podía comentarlo | Los Include son informativos; solo se repara un desajuste entre `sshd -T` y el socket real |
 
-## Integración CrowdSec
+## Integración Fail2ban
 
-Se incorporó como alternativa recomendada a Fail2ban, no como segundo motor simultáneo. La instalación usa el repositorio firmado oficial, colecciones Linux y Nginx, adquisición de logs de Nginx y un firewall bouncer compatible con el backend nftables/iptables detectado.
+Fail2ban es el único motor anti-fuerza-bruta administrado. SSH usa el journal de systemd y Nginx usa sus archivos de log, evitando mezclar `backend = systemd` con `logpath`. La acción de firewall se selecciona entre nftables e iptables según las capacidades instaladas.
 
-La decisión de no instalar AppSec/WAF por defecto reduce complejidad y posibles incompatibilidades. El firewall bouncer protege servicios de infraestructura y aplica decisiones de bloqueo; una aplicación con riesgo HTTP elevado puede incorporar el componente AppSec en una fase posterior y probarlo en modo controlado.
+La configuración se valida antes de reiniciar y se restaura automáticamente si falla. Los baneos incrementales reducen la reincidencia sin depender de servicios externos. Esta protección es reactiva y basada en logs: no reemplaza un WAF, parches de seguridad ni controles propios de la aplicación.
 
 ## Riesgos residuales
 
@@ -47,7 +48,7 @@ La decisión de no instalar AppSec/WAF por defecto reduce complejidad y posibles
 
 - Probar la versión en una VPS desechable antes de actualizar producción.
 - Mantener una consola del proveedor y dos sesiones SSH al cambiar acceso o firewall.
-- Elegir CrowdSec o Fail2ban, no ambos.
-- Revisar `systemctl --failed`, logs de Nginx/PHP y métricas CrowdSec después de cada despliegue.
+- Verificar `fail2ban-client -t` y el estado de cada jail después de cambiar logs, puertos o firewall.
+- Revisar `systemctl --failed`, logs de Nginx/PHP y eventos de Fail2ban después de cada despliegue.
 - Ejecutar restauraciones de prueba de backups SQL y del sitio, no solo comprobar que el archivo existe.
 - Ejecutar periódicamente `bash -n` y ShellCheck antes de publicar cambios.

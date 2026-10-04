@@ -1,11 +1,11 @@
 # DevLab Manager
 
-Gestor Bash interactivo para preparar y operar VPS/LXC de producción con **Nginx, PHP-FPM, MySQL o MariaDB, Cloudflare Tunnel, Git y CrowdSec/Fail2ban** sobre Debian 12 (bookworm) y Debian 13 (trixie).
+Gestor Bash interactivo para preparar y operar VPS/LXC de producción con **Nginx, PHP-FPM, MySQL o MariaDB, Cloudflare Tunnel, Git y Fail2ban** sobre Debian 12 (bookworm) y Debian 13 (trixie).
 
 Está orientado a múltiples aplicaciones PHP, HTML o JavaScript en un mismo servidor. Incluye creación de virtual hosts, despliegues desde GitHub, backups SQL, hardening SSH, firewall, monitoreo y auditoría básica.
 
 **Autor:** Marcos Espinoza Torres
-**Versión:** 2.0
+**Versión:** 2.1
 
 > Este script modifica servicios del sistema. Pruébalo primero en una VPS desechable o snapshot y mantén abierta una segunda sesión SSH durante cambios de firewall, puerto o autenticación.
 
@@ -14,7 +14,7 @@ Está orientado a múltiples aplicaciones PHP, HTML o JavaScript en un mismo ser
 - Debian 12 o Debian 13; otras distribuciones no están soportadas.
 - Ejecución como `root` o mediante `sudo`.
 - Terminal interactiva (TTY).
-- Acceso a Internet para APT, Sury, GitHub, Cloudflare y CrowdSec.
+- Acceso a Internet para APT, Sury, GitHub y Cloudflare.
 - Snapshot o backup del proveedor antes de preparar una VPS existente.
 
 ## Instalación
@@ -44,7 +44,7 @@ sudo devlab
 3. **Cloudflare Tunnel:** instalación, autenticación, túneles, `config.yml`, estado y logs.
 4. **Git / Deploy:** clave SSH, clone seguro, pull fast-forward y acciones post-deploy.
 5. **Sistema:** zona horaria, NTP, actualizaciones y comando global.
-6. **Seguridad:** UFW, CrowdSec o Fail2ban, claves SSH, hardening, headers y auditoría.
+6. **Seguridad:** UFW, Fail2ban, claves SSH, hardening, headers y auditoría.
 7. **Monitor:** CPU, RAM, disco, red, servicios y actividad Nginx.
 8. **Dev Tools:** logs, tráfico, benchmark, mantenimiento, Basic Auth y OPcache.
 9. **Estado:** resumen estático de servicios y sitios.
@@ -56,7 +56,7 @@ sudo devlab
 3. Crear el sitio y configurar MySQL/MariaDB solo si corresponde.
 4. Configurar la clave de despliegue y clonar el repositorio.
 5. Ejecutar **Seguridad → Blindaje completo**.
-6. Elegir **CrowdSec** como motor anti-intrusión recomendado.
+6. Instalar y validar **Fail2ban** para proteger SSH y Nginx.
 7. Configurar Cloudflare Tunnel o abrir 80/443 en UFW, no ambos por obligación.
 8. Ejecutar la auditoría y revisar que no queden advertencias críticas.
 9. Probar desde otra sesión antes de cerrar la conexión administrativa.
@@ -101,34 +101,29 @@ El flujo previsto es Mac → push a GitHub → deploy en el VPS.
 
 Los archivos no versionados, por ejemplo `.env`, no bloquean el pull. Aun así, deben respaldarse fuera del repositorio.
 
-## CrowdSec o Fail2ban
+## Fail2ban
 
-El menú ofrece ambos motores, pero recomienda seleccionar **uno solo** para evitar reglas duplicadas y diagnósticos confusos.
+Fail2ban es el único motor anti-fuerza-bruta administrado por el script. Se instala desde los repositorios del sistema y conserva sus eventos localmente.
 
-### CrowdSec (recomendado)
+La configuración administrada vive en `/etc/fail2ban/jail.d/99-devlab.local`; los archivos `.conf` distribuidos por el paquete no se modifican. Incluye:
 
-La integración instala desde el repositorio oficial:
-
-- motor `crowdsec`;
-- colecciones `crowdsecurity/linux` y `crowdsecurity/nginx`;
-- adquisición de `/var/log/nginx/*.log`;
-- firewall bouncer para nftables o iptables según el backend detectado.
+- jail SSH con backend `systemd` y el puerto efectivo del servidor;
+- jails Nginx con backend de archivos, solo cuando existen logs compatibles;
+- acción nftables cuando está disponible, con fallback a iptables;
+- baneos progresivos para reincidentes, desde una hora hasta una semana;
+- resolución DNS deshabilitada dentro de los filtros;
+- validación con `fail2ban-client -t` y rollback si la configuración o el reinicio fallan.
 
 Comandos útiles:
 
 ```bash
-sudo cscli metrics
-sudo cscli decisions list
-sudo cscli bouncers list
-sudo journalctl -u crowdsec -n 100 --no-pager
-sudo journalctl -u crowdsec-firewall-bouncer -n 100 --no-pager
+sudo fail2ban-client -t
+sudo fail2ban-client status
+sudo fail2ban-client status sshd
+sudo journalctl -u fail2ban -n 100 --no-pager
 ```
 
-CrowdSec aporta señales colaborativas y bloqueo a nivel firewall. Esta versión no instala AppSec/WAF; puede añadirse después si la aplicación necesita inspección HTTP avanzada.
-
-### Fail2ban
-
-Se conserva como alternativa local y simple, con jails para SSH, autenticación HTTP de Nginx y detección de bots. Al cambiar de motor, el script solicita deshabilitar el que ya esté activo.
+Cuando Nginx está detrás de Cloudflare, configura y verifica primero la restauración segura de la IP real del visitante. Deben confiarse exclusivamente las redes oficiales de Cloudflare; de lo contrario los logs pueden contener la IP del proxy y los bloqueos HTTP no serán efectivos. Fail2ban complementa UFW, las actualizaciones y el hardening SSH, pero no sustituye un WAF ni corrige vulnerabilidades de la aplicación.
 
 ## UFW y Cloudflare Tunnel
 
@@ -145,8 +140,10 @@ El alta de un sitio nunca habilita acceso root por contraseña. El endurecimient
 - usa `PermitRootLogin prohibit-password`;
 - permite deshabilitar contraseñas para todos los usuarios;
 - valida con `sshd -t` antes de reiniciar;
+- considera normales los `Port` declarados mediante `Include` cuando coinciden con `sshd -T` y el socket escuchado;
+- no modifica archivos SSH administrados por el proveedor durante un diagnóstico;
 - restaura el backup exacto si la validación falla;
-- abre primero el puerto nuevo en UFW y comprueba el puerto realmente escuchado.
+- para cambios de puerto crea `00-devlab-port.conf`, abre primero UFW y comprueba el puerto realmente escuchado.
 
 Mantén siempre una segunda terminal conectada y una consola alternativa del proveedor.
 
@@ -165,8 +162,8 @@ sudo nginx -t
 sudo sshd -t
 sudo systemctl --failed
 sudo ufw status verbose
-sudo cscli metrics                    # si elegiste CrowdSec
-sudo fail2ban-client status           # si elegiste Fail2ban
+sudo fail2ban-client -t
+sudo fail2ban-client status
 curl -I https://tu-dominio.cl
 curl -I https://tu-dominio.cl/.env    # debe responder 403 o 404
 ```
