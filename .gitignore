@@ -213,7 +213,7 @@ prepros.config
 
 # End of https://www.toptal.com/developers/gitignore/api/macos,webstorm,prepros,intellij+all
 
-# Configuración local y artefactos sensibles del operador
+# Configuración local de asistentes/IDE y artefactos sensibles del operador
 /.claude/
 /.idea/
 /.vscode/
