@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  DevLab Manager v2.1 - Marcos Espinoza Torres
+#  DevLab Manager v2.2 - Marcos Espinoza Torres
 #  Stack completo: Nginx · PHP-FPM · MySQL/MariaDB · Cloudflared | Debian 12/13
 # ==============================================================================
 set -euo pipefail
@@ -9,7 +9,7 @@ set -euo pipefail
 # que necesitan lectura de Nginx/PHP abren permisos de forma explícita después.
 umask 077
 
-readonly SCRIPT_VERSION="2.1 - Marcos Espinoza Torres"
+readonly SCRIPT_VERSION="2.2 - Marcos Espinoza Torres"
 readonly CATCH_ALL_FILE="/etc/nginx/sites-available/000-catch-all"
 readonly MARIADB_CNF="/etc/mysql/mariadb.conf.d/50-server.cnf"
 readonly MYSQL_CNF="/etc/mysql/mysql.conf.d/mysqld.cnf"
@@ -39,7 +39,8 @@ DB_HOST=""
 DB_PORT=""
 DB_NAME=""
 DB_USER=""
-CREATE_ENV_FILE="s"
+REQUIRES_DB="n"
+CREATE_ENV_FILE="n"
 APP_DIR=""
 UPLOAD_MAX_SIZE=""
 PRIMARY_HOST=""
@@ -172,9 +173,15 @@ prompt_yes_no() {
 
 prompt_password_generic() {
   local label="${1:-Clave}"
+  local allow_cancel="${2:-n}"
   local pass1 pass2
   while true; do
-    read -rsp "  ${label} (Enter = generar una segura): " pass1; echo
+    if [[ "$allow_cancel" == "s" ]]; then
+      read -rsp "  ${label} (Enter = generar; 0 = cancelar): " pass1; echo
+      [[ "$pass1" == "0" ]] && return 130
+    else
+      read -rsp "  ${label} (Enter = generar una segura): " pass1; echo
+    fi
     if [[ -z "$pass1" ]]; then
       command -v openssl >/dev/null 2>&1 \
         || { msg_error "openssl es necesario para generar secretos seguros."; continue; }
@@ -196,9 +203,14 @@ prompt_password_generic() {
 }
 
 prompt_upload_size() {
-  local input=""
+  local allow_cancel="${1:-n}" input=""
   while true; do
-    read -rp "  Tamaño máximo de subida (ej: 20M, 100M, 1G): " input
+    if [[ "$allow_cancel" == "s" ]]; then
+      read -rp "  Tamaño máximo de subida (ej: 20M, 100M, 1G; 0 = cancelar): " input
+      [[ "$input" == "0" ]] && return 130
+    else
+      read -rp "  Tamaño máximo de subida (ej: 20M, 100M, 1G): " input
+    fi
     [[ -z "$input" ]]   && msg_error "Campo obligatorio."                 && continue
     valid_size "$input" && REPLY_SIZE="$input" && return 0
     msg_error "Formato inválido. Usa número seguido de M o G."
@@ -215,11 +227,16 @@ detect_primary_ip() {
 }
 
 prompt_server_ip() {
-  local detected="" input=""
+  local allow_cancel="${1:-n}" detected="" input=""
   if detected="$(detect_primary_ip)"; then
     msg_info "IP detectada en este LXC: ${detected}"
     while true; do
-      read -rp "  IP local del LXC [${detected}]: " input
+      if [[ "$allow_cancel" == "s" ]]; then
+        read -rp "  IP local del LXC [${detected}] (0 = cancelar): " input
+        [[ "$input" == "0" ]] && return 130
+      else
+        read -rp "  IP local del LXC [${detected}]: " input
+      fi
       input="${input:-$detected}"
       valid_ip "$input" && SERVER_IP="$input" && return 0
       msg_error "IP inválida."
@@ -227,7 +244,12 @@ prompt_server_ip() {
   else
     msg_warn "No se pudo detectar la IP automáticamente."
     while true; do
-      read -rp "  IP local del LXC: " input
+      if [[ "$allow_cancel" == "s" ]]; then
+        read -rp "  IP local del LXC (0 = cancelar): " input
+        [[ "$input" == "0" ]] && return 130
+      else
+        read -rp "  IP local del LXC: " input
+      fi
       [[ -z "$input" ]] && msg_error "La IP es obligatoria." && continue
       valid_ip "$input" && SERVER_IP="$input" && return 0
       msg_error "IP inválida."
@@ -807,14 +829,29 @@ prompt_cleanup_if_needed() {
   local name="$1"
   site_has_residue "$name" || return 0
   msg_warn "Se detectaron residuos previos del sitio '${name}'."
-  prompt_yes_no "¿Eliminar también /var/www/${name}?" "s"; local rd="$REPLY_YESNO"
-  prompt_yes_no "¿Limpiar residuos antes de recrear?" "s"
-  if [[ "$REPLY_YESNO" == "s" ]]; then
-    cleanup_site_residue "$name" "$rd"
-    site_has_residue "$name" && { msg_error "Quedan residuos. Revisa manualmente."; return 1; }
-  else
-    msg_error "Operación cancelada."; return 1
-  fi
+  echo
+  echo "  1) Eliminar configuración y /var/www/${name}, luego recrear"
+  echo "  0) Cancelar sin modificar los residuos"
+  echo
+  local choice=""
+  while true; do
+    read -rp "  Opción [0]: " choice
+    choice="${choice:-0}"
+    case "$choice" in
+      1)
+        prompt_yes_no "¿Confirmas la eliminación completa de los residuos?" "n"
+        [[ "$REPLY_YESNO" == "s" ]] || return 130
+        cleanup_site_residue "$name" "s"
+        site_has_residue "$name" && {
+          msg_error "Quedan residuos. Revisa manualmente."
+          return 1
+        }
+        return 0
+        ;;
+      0) return 130 ;;
+      *) msg_error "Opción inválida." ;;
+    esac
+  done
 }
 
 rollback_failed_creation() {
@@ -826,61 +863,163 @@ rollback_failed_creation() {
 # CREACIÓN DE SITIO
 # ══════════════════════════════════════════════════════════════════════════════
 
-prompt_common_site_data() {
+reset_site_form() {
+  APP_DB_PASS=""
+  DB_PASS_VALUE=""
+  DB_PASS_GENERATED="n"
+  APP_NAME=""
+  SERVER_IP=""
+  PRIMARY_HOST=""
+  DB_HOST=""
+  DB_PORT=""
+  DB_NAME=""
+  DB_USER=""
+  REQUIRES_DB="n"
+  CREATE_ENV_FILE="n"
+  APP_DIR=""
+  UPLOAD_MAX_SIZE=""
+}
+
+prompt_site_env_choice() {
+  local description="básico, sin credenciales de base de datos"
+  [[ "$REQUIRES_DB" == "s" ]] && description="con la configuración de base de datos"
+  echo
+  echo "  ¿Crear archivo .env ${description}?"
+  echo "  1) Sí"
+  echo "  2) No"
+  echo "  0) Cancelar la creación"
+  echo
+  local choice=""
   while true; do
-    read -rp "  Nombre corto de la app (ej: mi-app): " APP_NAME
+    read -rp "  Opción [1]: " choice
+    choice="${choice:-1}"
+    case "$choice" in
+      1) CREATE_ENV_FILE="s"; return 0 ;;
+      2) CREATE_ENV_FILE="n"; return 0 ;;
+      0) return 130 ;;
+      *) msg_error "Opción inválida." ;;
+    esac
+  done
+}
+
+print_site_creation_plan() {
+  echo
+  echo -e "${BOLD}${CYAN}  Resumen antes de crear${RESET}"
+  echo
+  printf '  %-22s %s\n' "Aplicación:"         "$APP_NAME"
+  printf '  %-22s %s\n' "Dominio:"            "$PRIMARY_HOST"
+  printf '  %-22s %s\n' "IP del LXC:"         "$SERVER_IP"
+  printf '  %-22s %s\n' "Directorio:"         "$APP_DIR"
+  printf '  %-22s %s\n' "Máx. subida:"        "$UPLOAD_MAX_SIZE"
+  if [[ "$REQUIRES_DB" == "s" ]]; then
+    printf '  %-22s %s\n' "Base de datos:"      "Sí"
+    printf '  %-22s %s\n' "DB host:puerto:"     "${DB_HOST}:${DB_PORT}"
+    printf '  %-22s %s\n' "DB nombre/usuario:"  "${DB_NAME} / ${DB_USER}"
+  else
+    printf '  %-22s %s\n' "Base de datos:"      "No requerida"
+  fi
+  [[ "$CREATE_ENV_FILE" == "s" ]] \
+    && printf '  %-22s %s\n' "Archivo .env:" "Sí" \
+    || printf '  %-22s %s\n' "Archivo .env:" "No"
+  echo
+  echo "  1) Crear el sitio con esta configuración"
+  echo "  0) Cancelar sin realizar cambios"
+  echo
+  local choice=""
+  while true; do
+    read -rp "  Opción [1]: " choice
+    choice="${choice:-1}"
+    case "$choice" in
+      1) return 0 ;;
+      0) return 130 ;;
+      *) msg_error "Opción inválida." ;;
+    esac
+  done
+}
+
+prompt_common_site_data() {
+  reset_site_form
+
+  while true; do
+    read -rp "  Nombre corto de la app (ej: mi-app; 0 = cancelar): " APP_NAME
+    [[ "$APP_NAME" == "0" ]] && return 130
     [[ -z "$APP_NAME" ]] && msg_error "Nombre obligatorio." && continue
     valid_app_name "$APP_NAME" && break
     msg_error "Solo letras, números, punto, guion o guion bajo."
   done
 
-  prompt_server_ip
+  prompt_server_ip "s" || return $?
 
   while true; do
-    read -rp "  Dominio/FQDN (ej: wayhost.cl, app.wayhost.cl): " PRIMARY_HOST
+    read -rp "  Dominio/FQDN (ej: wayhost.cl; 0 = cancelar): " PRIMARY_HOST
+    [[ "$PRIMARY_HOST" == "0" ]] && return 130
     [[ -z "$PRIMARY_HOST" ]] && msg_error "Dominio obligatorio." && continue
     PRIMARY_HOST="${PRIMARY_HOST,,}"
     valid_fqdn "$PRIMARY_HOST" && break
     msg_error "Dominio inválido. Usa: dominio.tld o sub.dominio.tld"
   done
 
+  echo
+  echo "  ¿Este proyecto requiere base de datos?"
+  echo "  1) Sí — configurar conexión MySQL/MariaDB"
+  echo "  2) No — landing page o sitio sin base de datos"
+  echo "  0) Cancelar la creación"
+  echo
+  local db_choice=""
   while true; do
-    read -rp "  IP/hostname del servidor MariaDB: " DB_HOST
-    [[ -z "$DB_HOST" ]] && { msg_error "Host MariaDB obligatorio."; continue; }
-    valid_db_host "$DB_HOST" && break
-    msg_error "Host MariaDB inválido."
+    read -rp "  Opción: " db_choice
+    case "$db_choice" in
+      1) REQUIRES_DB="s"; break ;;
+      2) REQUIRES_DB="n"; break ;;
+      0) return 130 ;;
+      *) msg_error "Opción inválida." ;;
+    esac
   done
 
-  while true; do
-    read -rp "  Puerto MariaDB: " DB_PORT
-    [[ -z "$DB_PORT" ]] && msg_error "Puerto obligatorio." && continue
-    valid_port "$DB_PORT" && break
-    msg_error "Puerto inválido (1-65535)."
-  done
+  if [[ "$REQUIRES_DB" == "s" ]]; then
+    while true; do
+      read -rp "  IP/hostname del servidor de base de datos (0 = cancelar): " DB_HOST
+      [[ "$DB_HOST" == "0" ]] && return 130
+      [[ -z "$DB_HOST" ]] && { msg_error "Host de base de datos obligatorio."; continue; }
+      valid_db_host "$DB_HOST" && break
+      msg_error "Host de base de datos inválido."
+    done
 
-  while true; do
-    read -rp "  Nombre de la base de datos: " DB_NAME
-    [[ -z "$DB_NAME" ]] && msg_error "Nombre DB obligatorio." && continue
-    valid_db_name "$DB_NAME" && break
-    msg_error "Solo letras, números y guion bajo."
-  done
+    while true; do
+      read -rp "  Puerto de la base de datos (0 = cancelar): " DB_PORT
+      [[ "$DB_PORT" == "0" ]] && return 130
+      [[ -z "$DB_PORT" ]] && msg_error "Puerto obligatorio." && continue
+      valid_port "$DB_PORT" && break
+      msg_error "Puerto inválido (1-65535)."
+    done
 
-  while true; do
-    read -rp "  Usuario de la base de datos: " DB_USER
-    [[ -z "$DB_USER" ]] && msg_error "Usuario DB obligatorio." && continue
-    valid_db_user "$DB_USER" && break
-    msg_error "Solo letras, números y guion bajo."
-  done
+    while true; do
+      read -rp "  Nombre de la base de datos (0 = cancelar): " DB_NAME
+      [[ "$DB_NAME" == "0" ]] && return 130
+      [[ -z "$DB_NAME" ]] && msg_error "Nombre DB obligatorio." && continue
+      valid_db_name "$DB_NAME" && break
+      msg_error "Solo letras, números y guion bajo."
+    done
 
-  prompt_password_generic "Clave de la base de datos"
-  APP_DB_PASS="$DB_PASS_VALUE"
+    while true; do
+      read -rp "  Usuario de la base de datos (0 = cancelar): " DB_USER
+      [[ "$DB_USER" == "0" ]] && return 130
+      [[ -z "$DB_USER" ]] && msg_error "Usuario DB obligatorio." && continue
+      valid_db_user "$DB_USER" && break
+      msg_error "Solo letras, números y guion bajo."
+    done
 
-  prompt_upload_size; UPLOAD_MAX_SIZE="$REPLY_SIZE"
+    prompt_password_generic "Clave de la base de datos" "s" || return $?
+    APP_DB_PASS="$DB_PASS_VALUE"
+  fi
 
-  prompt_yes_no "¿Crear archivo .env con credenciales?" "s"
-  CREATE_ENV_FILE="$REPLY_YESNO"
+  prompt_upload_size "s" || return $?
+  UPLOAD_MAX_SIZE="$REPLY_SIZE"
+
+  prompt_site_env_choice || return $?
 
   APP_DIR="/var/www/${APP_NAME}"
+  print_site_creation_plan || return $?
 }
 
 write_app_files() {
@@ -896,18 +1035,23 @@ echo "<p>PHP version: " . PHP_VERSION . "</p>";
 PHP
 
   if [[ "${CREATE_ENV_FILE}" == "s" ]]; then
-    local env_app_name env_app_url env_db_host env_db_name env_db_user env_db_pass
+    local env_app_name env_app_url
     env_app_name="$(dotenv_quote "$APP_NAME")"
     env_app_url="$(dotenv_quote "https://${PRIMARY_HOST}")"
-    env_db_host="$(dotenv_quote "$DB_HOST")"
-    env_db_name="$(dotenv_quote "$DB_NAME")"
-    env_db_user="$(dotenv_quote "$DB_USER")"
-    env_db_pass="$(dotenv_quote "$APP_DB_PASS")"
     cat > "${APP_DIR}/.env" <<EOF
 APP_NAME=${env_app_name}
 APP_ENV=production
 APP_DEBUG=false
 APP_URL=${env_app_url}
+EOF
+
+    if [[ "$REQUIRES_DB" == "s" ]]; then
+      local env_db_host env_db_name env_db_user env_db_pass
+      env_db_host="$(dotenv_quote "$DB_HOST")"
+      env_db_name="$(dotenv_quote "$DB_NAME")"
+      env_db_user="$(dotenv_quote "$DB_USER")"
+      env_db_pass="$(dotenv_quote "$APP_DB_PASS")"
+      cat >> "${APP_DIR}/.env" <<EOF
 
 DB_CONNECTION=mysql
 DB_HOST=${env_db_host}
@@ -916,6 +1060,7 @@ DB_DATABASE=${env_db_name}
 DB_USERNAME=${env_db_user}
 DB_PASSWORD=${env_db_pass}
 EOF
+    fi
   fi
 
   _apply_site_code_perms "${APP_DIR}"
@@ -1109,8 +1254,13 @@ print_creation_summary() {
   printf '  %-22s %s\n' "Dominio:"           "http://${PRIMARY_HOST}"
   printf '  %-22s %s\n' "Raíz app:"          "${APP_DIR}/public"
   printf '  %-22s %s\n' "Uploads:"           "${APP_DIR}/public/uploads"
-  printf '  %-22s %s\n' "DB host:puerto:"    "${DB_HOST}:${DB_PORT}"
-  printf '  %-22s %s\n' "DB nombre/usuario:" "${DB_NAME} / ${DB_USER}"
+  if [[ "$REQUIRES_DB" == "s" ]]; then
+    printf '  %-22s %s\n' "Base de datos:"     "Configurada"
+    printf '  %-22s %s\n' "DB host:puerto:"    "${DB_HOST}:${DB_PORT}"
+    printf '  %-22s %s\n' "DB nombre/usuario:" "${DB_NAME} / ${DB_USER}"
+  else
+    printf '  %-22s %s\n' "Base de datos:"     "No requerida"
+  fi
   printf '  %-22s %s\n' "Máx. subida:"       "${UPLOAD_MAX_SIZE}"
   [[ "${CREATE_ENV_FILE}" == "s" ]] \
     && printf '  %-22s %s\n' "Archivo .env:" "${APP_DIR}/.env"
@@ -1131,18 +1281,46 @@ print_creation_summary() {
 
 create_site_custom_domain() {
   ensure_web_stack_installed || return 1
-  msg_section "Crear sitio PHP con dominio personalizado"
-  prompt_common_site_data
-  prompt_cleanup_if_needed "${APP_NAME}" || return 1
+  msg_section "Crear sitio web con dominio personalizado"
+  local rc=0
+  prompt_common_site_data || rc=$?
+  if (( rc != 0 )); then
+    reset_site_form
+    if (( rc == 130 )); then
+      msg_warn "Creación cancelada. No se realizaron cambios."
+      return 0
+    fi
+    return "$rc"
+  fi
+  rc=0
+  prompt_cleanup_if_needed "${APP_NAME}" || rc=$?
+  if (( rc != 0 )); then
+    reset_site_form
+    if (( rc == 130 )); then
+      msg_warn "Creación cancelada. No se modificó el sitio existente."
+      return 0
+    fi
+    return "$rc"
+  fi
 
-  msg_info "[1/5] Creando estructura y archivos..."
-  write_app_files
+  msg_info "[1/4] Creando estructura y archivos..."
+  if ! write_app_files; then
+    rollback_failed_creation "${APP_NAME}"
+    return 1
+  fi
 
-  msg_info "[2/5] Configurando Nginx..."
-  write_nginx_site; enable_nginx_site || return 1
+  msg_info "[2/4] Configurando Nginx..."
+  if ! write_nginx_site; then
+    rollback_failed_creation "${APP_NAME}"
+    return 1
+  fi
+  enable_nginx_site || return 1
 
-  msg_info "[3/5] Ajustando límites PHP-FPM..."
-  configure_php_upload_limits
+  msg_info "[3/4] Ajustando límites PHP-FPM..."
+  if ! configure_php_upload_limits; then
+    rollback_failed_creation "${APP_NAME}"
+    return 1
+  fi
 
   msg_info "[4/4] Finalizado."
   print_creation_summary
@@ -5474,7 +5652,7 @@ menu_web_stack() {
     echo -e "  ${CYAN} 1)${RESET} Instalar stack base (Nginx + PHP)"
     echo -e "  ${CYAN} 2)${RESET} Instalar extensión PHP adicional"
     menu_cat "Sitios" "$CYAN"
-    echo -e "  ${CYAN} 3)${RESET} Crear sitio con dominio personalizado"
+    echo -e "  ${CYAN} 3)${RESET} Crear sitio con dominio (base de datos opcional)"
     echo -e "  ${CYAN} 4)${RESET} Listar sitios"
     echo -e "  ${CYAN} 5)${RESET} Probar sitio"
     echo -e "  ${CYAN} 6)${RESET} Eliminar sitio"

@@ -63,7 +63,9 @@ sudo devlab
 
 ## Modelo de seguridad de los sitios
 
-El generador crea una estructura mínima, sin publicar `phpinfo()` ni pruebas de conexión a la base de datos:
+El generador permite elegir si el proyecto necesita MySQL/MariaDB. Una landing page puede crearse sin configurar host, puerto, usuario ni contraseña de base de datos. Antes de modificar el servidor muestra un resumen y permite cancelar; los campos relevantes también aceptan `0` para salir sin dejar una creación parcial.
+
+La estructura es mínima y no publica `phpinfo()` ni pruebas de conexión a la base de datos:
 
 ```text
 /var/www/<app-name>/
@@ -72,7 +74,7 @@ El generador crea una estructura mínima, sin publicar `phpinfo()` ni pruebas de
 │   └── uploads/
 ├── storage/
 ├── logs/
-└── .env
+└── .env                 # opcional; DB_* solo cuando el proyecto usa base de datos
 ```
 
 Permisos aplicados:
