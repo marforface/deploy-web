@@ -5,7 +5,7 @@ Gestor Bash interactivo para preparar y operar VPS/LXC de producción con **Ngin
 Está orientado a múltiples aplicaciones PHP, HTML o JavaScript en un mismo servidor. Incluye creación de virtual hosts, despliegues desde GitHub, backups SQL, hardening SSH, firewall, monitoreo y auditoría básica.
 
 **Autor:** Marcos Espinoza Torres
-**Versión:** 2.3
+**Versión:** 2.4
 
 > Este script modifica servicios del sistema. Pruébalo primero en una VPS desechable o snapshot y mantén abierta una segunda sesión SSH durante cambios de firewall, puerto o autenticación.
 
@@ -70,6 +70,8 @@ El asistente muestra el plan completo antes de modificar el servidor. Las decisi
 ## Modelo de seguridad de los sitios
 
 El generador permite elegir si el proyecto necesita MySQL/MariaDB. Una landing page puede crearse sin configurar host, puerto, usuario ni contraseña de base de datos. Antes de modificar el servidor muestra un resumen y permite cancelar; los campos relevantes también aceptan `0` para salir sin dejar una creación parcial.
+
+Cuando se selecciona una base local (`127.0.0.1` o `localhost`) y existe un motor MySQL/MariaDB instalado, el mismo asistente puede crear la base, el usuario y otorgarle permisos únicamente sobre esa base. Si cualquiera de esos objetos ya existe, no altera contraseñas ni privilegios: permite volver y seleccionar el modo de conexión existente. Las conexiones a servidores remotos solo se guardan en el sitio, porque su aprovisionamiento requiere credenciales administrativas externas.
 
 La estructura es mínima y no publica `phpinfo()` ni pruebas de conexión a la base de datos:
 

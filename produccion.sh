@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  DevLab Manager v2.3 - Marcos Espinoza Torres
+#  DevLab Manager v2.4 - Marcos Espinoza Torres
 #  Stack completo: Nginx · PHP-FPM · MySQL/MariaDB · Cloudflared | Debian 12/13
 # ==============================================================================
 set -euo pipefail
@@ -9,7 +9,7 @@ set -euo pipefail
 # que necesitan lectura de Nginx/PHP abren permisos de forma explícita después.
 umask 077
 
-readonly SCRIPT_VERSION="2.3 - Marcos Espinoza Torres"
+readonly SCRIPT_VERSION="2.4 - Marcos Espinoza Torres"
 readonly CATCH_ALL_FILE="/etc/nginx/sites-available/000-catch-all"
 readonly MARIADB_CNF="/etc/mysql/mariadb.conf.d/50-server.cnf"
 readonly MYSQL_CNF="/etc/mysql/mysql.conf.d/mysqld.cnf"
@@ -40,6 +40,10 @@ DB_PORT=""
 DB_NAME=""
 DB_USER=""
 REQUIRES_DB="n"
+PROVISION_DATABASE="n"
+DB_ACCOUNT_HOST=""
+DB_CREATED_BY_SITE="n"
+DB_USER_CREATED_BY_SITE="n"
 CREATE_ENV_FILE="n"
 APP_DIR=""
 UPLOAD_MAX_SIZE=""
@@ -878,6 +882,9 @@ prompt_cleanup_if_needed() {
 rollback_failed_creation() {
   msg_warn "Aplicando rollback por fallo en la creación de '${1}'."
   cleanup_site_residue "${1}" "s"
+  rollback_site_database
+  APP_DB_PASS=""
+  DB_PASS_VALUE=""
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -896,9 +903,140 @@ reset_site_form() {
   DB_NAME=""
   DB_USER=""
   REQUIRES_DB="n"
+  PROVISION_DATABASE="n"
+  DB_ACCOUNT_HOST=""
+  DB_CREATED_BY_SITE="n"
+  DB_USER_CREATED_BY_SITE="n"
   CREATE_ENV_FILE="n"
   APP_DIR=""
   UPLOAD_MAX_SIZE=""
+}
+
+db_host_is_local() {
+  [[ "$DB_HOST" == "localhost" || "$DB_HOST" == "127.0.0.1" ]]
+}
+
+prompt_site_db_provisioning() {
+  PROVISION_DATABASE="n"
+  DB_ACCOUNT_HOST=""
+
+  if ! db_host_is_local; then
+    msg_info "El host de base de datos es remoto; solo se guardará la conexión en el sitio."
+    msg_info "El aprovisionamiento remoto requiere credenciales administrativas y se mantiene fuera de este flujo."
+    return 0
+  fi
+
+  DB_ACCOUNT_HOST="$DB_HOST"
+  echo
+  local engine=""
+  engine="$(db_engine)"
+  if [[ "$engine" == "conflict" ]]; then
+    msg_error "MySQL y MariaDB están instalados simultáneamente."
+    msg_info "Resuelve el conflicto antes de aprovisionar una base para el sitio."
+    return 1
+  fi
+  if [[ -z "$engine" ]]; then
+    msg_warn "No hay un motor MySQL/MariaDB local instalado."
+    msg_info "Se guardará la conexión, pero la base y el usuario deberán existir antes de usar el sitio."
+    return 0
+  fi
+
+  echo "  ¿Qué hacer con la base de datos local?"
+  echo "  1) Crear ahora la base, el usuario y sus permisos (recomendado)"
+  echo "  2) Solo configurar el sitio; la base y el usuario ya existen"
+  echo "  0) Cancelar la creación"
+  echo
+  local choice=""
+  while true; do
+    read -rp "  Opción [1]: " choice
+    choice="${choice:-1}"
+    case "$choice" in
+      1) PROVISION_DATABASE="s"; return 0 ;;
+      2) PROVISION_DATABASE="n"; return 0 ;;
+      0) return 130 ;;
+      *) msg_error "Opción inválida." ;;
+    esac
+  done
+}
+
+validate_site_database_provision() {
+  [[ "$PROVISION_DATABASE" == "s" ]] || return 0
+  require_mariadb || return 1
+
+  local escaped_user escaped_host database_exists user_exists
+  escaped_user="$(db_sql_escape "$DB_USER")"
+  escaped_host="$(db_sql_escape "$DB_ACCOUNT_HOST")"
+
+  database_exists="$(db_cli -sN -e \
+    "SELECT COUNT(*) FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME='${DB_NAME}';" \
+    2>/dev/null)" || {
+      msg_error "No se pudo consultar el catálogo de bases de datos."
+      return 1
+    }
+  user_exists="$(db_cli -sN -e \
+    "SELECT COUNT(*) FROM mysql.user WHERE User='${escaped_user}' AND Host='${escaped_host}';" \
+    2>/dev/null)" || {
+      msg_error "No se pudo consultar el catálogo de usuarios del motor SQL."
+      return 1
+    }
+
+  if [[ "$database_exists" != "0" || "$user_exists" != "0" ]]; then
+    msg_error "No se aprovisionará sobre objetos existentes."
+    [[ "$database_exists" != "0" ]] \
+      && msg_warn "La base '${DB_NAME}' ya existe."
+    [[ "$user_exists" != "0" ]] \
+      && msg_warn "El usuario '${DB_USER}'@'${DB_ACCOUNT_HOST}' ya existe."
+    msg_info "Vuelve a crear el sitio y elige 'Solo configurar el sitio' para reutilizarlos."
+    return 1
+  fi
+}
+
+provision_site_database() {
+  [[ "$PROVISION_DATABASE" == "s" ]] || return 0
+  validate_site_database_provision || return 1
+
+  local escaped_password escaped_user escaped_host
+  escaped_password="$(db_sql_escape "$APP_DB_PASS")"
+  escaped_user="$(db_sql_escape "$DB_USER")"
+  escaped_host="$(db_sql_escape "$DB_ACCOUNT_HOST")"
+
+  if ! db_cli <<SQL
+CREATE DATABASE \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER '${escaped_user}'@'${escaped_host}' IDENTIFIED BY '${escaped_password}';
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${escaped_user}'@'${escaped_host}';
+FLUSH PRIVILEGES;
+SQL
+  then
+    msg_error "Falló el aprovisionamiento; se intentará retirar cualquier objeto creado por esta etapa."
+    db_cli -e "DROP USER IF EXISTS '${escaped_user}'@'${escaped_host}';" >/dev/null 2>&1 || true
+    db_cli -e "DROP DATABASE IF EXISTS \`${DB_NAME}\`;" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  DB_CREATED_BY_SITE="s"
+  DB_USER_CREATED_BY_SITE="s"
+  msg_ok "Base creada: ${DB_NAME}"
+  msg_ok "Usuario creado: ${DB_USER}@${DB_ACCOUNT_HOST}"
+  msg_ok "Permisos limitados a: ${DB_NAME}.*"
+}
+
+rollback_site_database() {
+  [[ "$DB_CREATED_BY_SITE" == "s" || "$DB_USER_CREATED_BY_SITE" == "s" ]] || return 0
+
+  local escaped_user escaped_host
+  escaped_user="$(db_sql_escape "$DB_USER")"
+  escaped_host="$(db_sql_escape "$DB_ACCOUNT_HOST")"
+  msg_warn "Retirando base y usuario creados por este intento fallido."
+  if [[ "$DB_USER_CREATED_BY_SITE" == "s" ]]; then
+    db_cli -e "DROP USER IF EXISTS '${escaped_user}'@'${escaped_host}';" >/dev/null 2>&1 \
+      || msg_error "No se pudo retirar el usuario SQL ${DB_USER}@${DB_ACCOUNT_HOST}."
+  fi
+  if [[ "$DB_CREATED_BY_SITE" == "s" ]]; then
+    db_cli -e "DROP DATABASE IF EXISTS \`${DB_NAME}\`;" >/dev/null 2>&1 \
+      || msg_error "No se pudo retirar la base ${DB_NAME}."
+  fi
+  DB_CREATED_BY_SITE="n"
+  DB_USER_CREATED_BY_SITE="n"
 }
 
 prompt_site_env_choice() {
@@ -936,6 +1074,12 @@ print_site_creation_plan() {
     printf '  %-22s %s\n' "Base de datos:"      "Sí"
     printf '  %-22s %s\n' "DB host:puerto:"     "${DB_HOST}:${DB_PORT}"
     printf '  %-22s %s\n' "DB nombre/usuario:"  "${DB_NAME} / ${DB_USER}"
+    if [[ "$PROVISION_DATABASE" == "s" ]]; then
+      printf '  %-22s %s\n' "Aprovisionamiento:"  "Crear base + usuario en $(db_label)"
+      printf '  %-22s %s\n' "Cuenta SQL:"          "${DB_USER}@${DB_ACCOUNT_HOST}"
+    else
+      printf '  %-22s %s\n' "Aprovisionamiento:"  "Usar configuración existente"
+    fi
   else
     printf '  %-22s %s\n' "Base de datos:"      "No requerida"
   fi
@@ -999,17 +1143,17 @@ prompt_common_site_data() {
 
   if [[ "$REQUIRES_DB" == "s" ]]; then
     while true; do
-      read -rp "  IP/hostname del servidor de base de datos (0 = cancelar): " DB_HOST
+      read -rp "  IP/hostname del servidor de base de datos [127.0.0.1] (0 = cancelar): " DB_HOST
       [[ "$DB_HOST" == "0" ]] && return 130
-      [[ -z "$DB_HOST" ]] && { msg_error "Host de base de datos obligatorio."; continue; }
+      DB_HOST="${DB_HOST:-127.0.0.1}"
       valid_db_host "$DB_HOST" && break
       msg_error "Host de base de datos inválido."
     done
 
     while true; do
-      read -rp "  Puerto de la base de datos (0 = cancelar): " DB_PORT
+      read -rp "  Puerto de la base de datos [3306] (0 = cancelar): " DB_PORT
       [[ "$DB_PORT" == "0" ]] && return 130
-      [[ -z "$DB_PORT" ]] && msg_error "Puerto obligatorio." && continue
+      DB_PORT="${DB_PORT:-3306}"
       valid_port "$DB_PORT" && break
       msg_error "Puerto inválido (1-65535)."
     done
@@ -1032,6 +1176,7 @@ prompt_common_site_data() {
 
     prompt_password_generic "Clave de la base de datos" "s" || return $?
     APP_DB_PASS="$DB_PASS_VALUE"
+    prompt_site_db_provisioning || return $?
   fi
 
   prompt_upload_size "s" || return $?
@@ -1256,13 +1401,20 @@ change_upload_limits() {
 }
 
 enable_nginx_site() {
-  rm -f /etc/nginx/sites-enabled/default
-  ln -sf "/etc/nginx/sites-available/${APP_NAME}" "/etc/nginx/sites-enabled/${APP_NAME}"
+  rm -f /etc/nginx/sites-enabled/default || return 1
+  if ! ln -sf "/etc/nginx/sites-available/${APP_NAME}" "/etc/nginx/sites-enabled/${APP_NAME}"; then
+    rollback_failed_creation "${APP_NAME}"
+    return 1
+  fi
   if ! nginx -t; then
     echo; msg_error "Validación de Nginx falló."
     rollback_failed_creation "${APP_NAME}"; return 1
   fi
-  systemctl reload nginx
+  if ! systemctl reload nginx; then
+    msg_error "No se pudo recargar Nginx."
+    rollback_failed_creation "${APP_NAME}"
+    return 1
+  fi
 }
 
 print_creation_summary() {
@@ -1276,7 +1428,12 @@ print_creation_summary() {
   printf '  %-22s %s\n' "Raíz app:"          "${APP_DIR}/public"
   printf '  %-22s %s\n' "Uploads:"           "${APP_DIR}/public/uploads"
   if [[ "$REQUIRES_DB" == "s" ]]; then
-    printf '  %-22s %s\n' "Base de datos:"     "Configurada"
+    if [[ "$PROVISION_DATABASE" == "s" ]]; then
+      printf '  %-22s %s\n' "Base de datos:"     "Creada en $(db_label)"
+      printf '  %-22s %s\n' "Cuenta SQL:"         "${DB_USER}@${DB_ACCOUNT_HOST}"
+    else
+      printf '  %-22s %s\n' "Base de datos:"     "Conexión configurada"
+    fi
     printf '  %-22s %s\n' "DB host:puerto:"    "${DB_HOST}:${DB_PORT}"
     printf '  %-22s %s\n' "DB nombre/usuario:" "${DB_NAME} / ${DB_USER}"
   else
@@ -1313,6 +1470,13 @@ create_site_custom_domain() {
     fi
     return "$rc"
   fi
+  if [[ "$PROVISION_DATABASE" == "s" ]]; then
+    if ! validate_site_database_provision; then
+      APP_DB_PASS=""
+      DB_PASS_VALUE=""
+      return 1
+    fi
+  fi
   rc=0
   prompt_cleanup_if_needed "${APP_NAME}" || rc=$?
   if (( rc != 0 )); then
@@ -1324,26 +1488,41 @@ create_site_custom_domain() {
     return "$rc"
   fi
 
-  msg_info "[1/4] Creando estructura y archivos..."
+  local step=1 total=4
+  if [[ "$PROVISION_DATABASE" == "s" ]]; then
+    total=5
+    msg_info "[${step}/${total}] Creando base de datos, usuario y permisos..."
+    if ! provision_site_database; then
+      APP_DB_PASS=""
+      DB_PASS_VALUE=""
+      return 1
+    fi
+    ((step++)) || true
+  fi
+
+  msg_info "[${step}/${total}] Creando estructura y archivos..."
   if ! write_app_files; then
     rollback_failed_creation "${APP_NAME}"
     return 1
   fi
+  ((step++)) || true
 
-  msg_info "[2/4] Configurando Nginx..."
+  msg_info "[${step}/${total}] Configurando Nginx..."
   if ! write_nginx_site; then
     rollback_failed_creation "${APP_NAME}"
     return 1
   fi
   enable_nginx_site || return 1
+  ((step++)) || true
 
-  msg_info "[3/4] Ajustando límites PHP-FPM..."
+  msg_info "[${step}/${total}] Ajustando límites PHP-FPM..."
   if ! configure_php_upload_limits; then
     rollback_failed_creation "${APP_NAME}"
     return 1
   fi
+  ((step++)) || true
 
-  msg_info "[4/4] Finalizado."
+  msg_info "[${step}/${total}] Finalizado."
   print_creation_summary
 
   if cf_installed; then
