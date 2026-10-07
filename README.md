@@ -5,7 +5,7 @@ Gestor Bash interactivo para preparar y operar VPS/LXC de producción con **Ngin
 Está orientado a múltiples aplicaciones PHP, HTML o JavaScript en un mismo servidor. Incluye creación de virtual hosts, despliegues desde GitHub, backups SQL, hardening SSH, firewall, monitoreo y auditoría básica.
 
 **Autor:** Marcos Espinoza Torres
-**Versión:** 2.1
+**Versión:** 2.3
 
 > Este script modifica servicios del sistema. Pruébalo primero en una VPS desechable o snapshot y mantén abierta una segunda sesión SSH durante cambios de firewall, puerto o autenticación.
 
@@ -39,6 +39,13 @@ sudo devlab
 
 ## Funciones principales
 
+Desde el menú principal, **A) Puesta en marcha** ofrece dos perfiles:
+
+- **Completo recomendado:** instala Nginx, PHP-FPM y extensiones; pregunta si usar MariaDB, MySQL o ningún motor; configura Cloudflare Tunnel; y ejecuta el blindaje.
+- **Personalizado:** permite incluir u omitir por separado el stack web, Cloudflare y seguridad. Cloudflare puede instalarse como paquete únicamente o configurarse con autenticación, túnel y servicio systemd.
+
+El asistente muestra el plan completo antes de modificar el servidor. Las decisiones críticas de SSH, firewall y autenticación externa conservan sus confirmaciones propias para prevenir pérdida de acceso.
+
 1. **Stack Web:** Nginx, PHP-FPM 8.1–8.4, extensiones, virtual hosts, límites PHP y catch-all.
 2. **MySQL / MariaDB:** instalación, bases, usuarios, grants, diagnóstico, backups y restauración.
 3. **Cloudflare Tunnel:** instalación, autenticación, túneles, `config.yml`, estado y logs.
@@ -52,14 +59,13 @@ sudo devlab
 ## Flujo recomendado para una VPS nueva
 
 1. Crear un snapshot y abrir dos sesiones SSH.
-2. Instalar el stack web y seleccionar una versión PHP compatible con la aplicación.
-3. Crear el sitio y configurar MySQL/MariaDB solo si corresponde.
-4. Configurar la clave de despliegue y clonar el repositorio.
-5. Ejecutar **Seguridad → Blindaje completo**.
-6. Instalar y validar **Fail2ban** para proteger SSH y Nginx.
-7. Configurar Cloudflare Tunnel o abrir 80/443 en UFW, no ambos por obligación.
-8. Ejecutar la auditoría y revisar que no queden advertencias críticas.
-9. Probar desde otra sesión antes de cerrar la conexión administrativa.
+2. Ejecutar **A) Puesta en marcha** y seleccionar el perfil completo o personalizado.
+3. Elegir MariaDB, MySQL o ningún motor según las necesidades del proyecto.
+4. Crear el sitio y configurar sus credenciales SQL solo cuando corresponda.
+5. Configurar la clave de despliegue y clonar el repositorio.
+6. Verificar el túnel, `config.yml` y las rutas DNS de Cloudflare.
+7. Ejecutar la auditoría y resolver cualquier etapa que el asistente haya marcado con error.
+8. Probar SSH desde otra sesión antes de cerrar la conexión administrativa.
 
 ## Modelo de seguridad de los sitios
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  DevLab Manager v2.2 - Marcos Espinoza Torres
+#  DevLab Manager v2.3 - Marcos Espinoza Torres
 #  Stack completo: Nginx · PHP-FPM · MySQL/MariaDB · Cloudflared | Debian 12/13
 # ==============================================================================
 set -euo pipefail
@@ -9,7 +9,7 @@ set -euo pipefail
 # que necesitan lectura de Nginx/PHP abren permisos de forma explícita después.
 umask 077
 
-readonly SCRIPT_VERSION="2.2 - Marcos Espinoza Torres"
+readonly SCRIPT_VERSION="2.3 - Marcos Espinoza Torres"
 readonly CATCH_ALL_FILE="/etc/nginx/sites-available/000-catch-all"
 readonly MARIADB_CNF="/etc/mysql/mariadb.conf.d/50-server.cnf"
 readonly MYSQL_CNF="/etc/mysql/mysql.conf.d/mysqld.cnf"
@@ -378,7 +378,7 @@ show_php_status() {
 }
 
 install_catch_all() {
-  cat > "${CATCH_ALL_FILE}" <<'EOF'
+  if ! cat > "${CATCH_ALL_FILE}" <<'EOF'
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
@@ -387,62 +387,83 @@ server {
     return 444;
 }
 EOF
+  then
+    msg_error "No se pudo escribir el catch-all de Nginx."
+    return 1
+  fi
   rm -f /etc/nginx/sites-enabled/default
-  ln -sf "${CATCH_ALL_FILE}" /etc/nginx/sites-enabled/000-catch-all
-  nginx -t >/dev/null 2>&1 && systemctl reload nginx && msg_ok "Catch-all bloqueador instalado." \
-    || msg_error "nginx -t falló al instalar catch-all."
+  ln -sf "${CATCH_ALL_FILE}" /etc/nginx/sites-enabled/000-catch-all || return 1
+  if nginx -t >/dev/null 2>&1 && systemctl reload nginx; then
+    msg_ok "Catch-all bloqueador instalado."
+  else
+    msg_error "nginx -t falló al instalar catch-all."
+    return 1
+  fi
 }
 
 install_base_stack() {
+  local offer_cloudflared="${1:-s}"
+  local selected_php="${2:-}"
   detect_debian_codename
-  echo
-  msg_info "¿Qué versión de PHP deseas instalar?"
-  select_php_version "install" || { msg_warn "Instalación cancelada."; return 1; }
+  if [[ -n "$selected_php" ]]; then
+    PHP_VERSION="$selected_php"
+    msg_info "Versión PHP seleccionada previamente: ${PHP_VERSION}"
+  else
+    echo
+    msg_info "¿Qué versión de PHP deseas instalar?"
+    select_php_version "install" || { msg_warn "Instalación cancelada."; return 1; }
+  fi
   echo
 
   msg_info "[1/6] Actualizando sistema..."
-  apt-get update && apt-get upgrade -y
+  apt-get update && apt-get upgrade -y || return 1
 
   msg_info "[2/6] Instalando utilidades base..."
-  apt-get install -y curl wget git unzip nano htop ca-certificates lsb-release gnupg acl
+  apt-get install -y curl wget git unzip nano htop ca-certificates lsb-release gnupg acl \
+    || return 1
 
   msg_info "[3/6] Instalando Nginx..."
-  apt-get install -y nginx
-  systemctl enable --now nginx
+  apt-get install -y nginx || return 1
+  systemctl enable --now nginx || return 1
 
   msg_info "[4/6] Agregando repositorio Sury para PHP ${PHP_VERSION} (${DEBIAN_CODENAME})..."
-  install -d -m 0755 /usr/share/keyrings
+  install -d -m 0755 /usr/share/keyrings || return 1
   local sury_key_tmp
-  sury_key_tmp="$(mktemp)"
+  sury_key_tmp="$(mktemp)" || return 1
   if ! curl --fail --silent --show-error --location \
       https://packages.sury.org/php/apt.gpg --output "$sury_key_tmp"; then
     rm -f "$sury_key_tmp"
     msg_error "No se pudo descargar la clave del repositorio Sury."
     return 1
   fi
-  install -m 0644 "$sury_key_tmp" /usr/share/keyrings/deb.sury.org-php.gpg
+  if ! install -m 0644 "$sury_key_tmp" /usr/share/keyrings/deb.sury.org-php.gpg; then
+    rm -f "$sury_key_tmp"
+    return 1
+  fi
   rm -f "$sury_key_tmp"
-  echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] \
+  if ! echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] \
 https://packages.sury.org/php/ ${DEBIAN_CODENAME} main" \
-    > /etc/apt/sources.list.d/php.list
-  apt-get update
+    > /etc/apt/sources.list.d/php.list; then
+    return 1
+  fi
+  apt-get update || return 1
 
   msg_info "[5/6] Instalando PHP ${PHP_VERSION}..."
   local php_modules=(fpm cli common mysql curl gd mbstring xml zip
                      bcmath intl soap imagick redis opcache)
   local php_pkgs=() m
   for m in "${php_modules[@]}"; do php_pkgs+=("php${PHP_VERSION}-${m}"); done
-  apt-get install -y "${php_pkgs[@]}"
-  systemctl enable --now "php${PHP_VERSION}-fpm"
+  apt-get install -y "${php_pkgs[@]}" || return 1
+  systemctl enable --now "php${PHP_VERSION}-fpm" || return 1
 
   msg_info "[6/6] Instalando catch-all bloqueador..."
-  install_catch_all
+  install_catch_all || return 1
 
   echo
   msg_ok "Stack base listo: Nginx + PHP ${PHP_VERSION}-FPM en ${DEBIAN_CODENAME}."
 
   # Ofrecer cloudflared para dejar el entorno listo para publicar sitios
-  if ! cf_installed; then
+  if [[ "$offer_cloudflared" == "s" ]] && ! cf_installed; then
     echo
     msg_info "Para publicar sitios vía Cloudflare Tunnel se recomienda instalar cloudflared ahora."
     prompt_yes_no "¿Instalar cloudflared?" "s"
@@ -460,7 +481,7 @@ https://packages.sury.org/php/ ${DEBIAN_CODENAME} main" \
         msg_info "Cuando quieras: Cloudflare → opción 2 (Autenticar) → opción 3 (Crear tunnel)."
       fi
     fi
-  else
+  elif [[ "$offer_cloudflared" == "s" ]]; then
     echo
     msg_ok "cloudflared ya está instalado en esta máquina."
   fi
@@ -1713,7 +1734,7 @@ require_mariadb() {
   service="$(db_service)"
   if ! systemctl is-active --quiet "$service"; then
     msg_warn "${label} instalado pero inactivo. Iniciando..."
-    systemctl enable --now "$service"
+    systemctl enable --now "$service" || return 1
   fi
 }
 
@@ -1777,28 +1798,37 @@ _select_app_user() {
 }
 
 install_mariadb() {
-  local engine service
+  local requested_engine="${1:-}" engine service
   engine="$(db_engine)"
   if [[ "$engine" == "conflict" ]]; then
     msg_error "MySQL y MariaDB están instalados simultáneamente. Resuelve el conflicto antes de continuar."
     return 1
   fi
   if [[ -n "$engine" ]]; then
+    if [[ -n "$requested_engine" && "$requested_engine" != "$engine" ]]; then
+      msg_error "Ya está instalado $(db_label); no se instalará ${requested_engine} en paralelo."
+      msg_info "Desinstala o migra el motor actual de forma controlada antes de cambiarlo."
+      return 1
+    fi
     service="$(db_service)"
     msg_warn "$(db_label) ya está instalado."
-    systemctl enable --now "$service"
+    systemctl enable --now "$service" || return 1
     msg_ok "Servicio activo y habilitado."
     msg_info "Puedes endurecer con: mysql_secure_installation"
     return 0
   fi
 
-  msg_section "Instalar motor SQL"
-  echo "  1) MariaDB Server      — recomendado para Debian; instalación nativa"
-  echo "  2) MySQL Community     — requiere paquete mysql-server en los repositorios activos"
-  echo "  0) Cancelar"
-  echo
-  local opt package client label
-  read -rp "  Opción: " opt
+  local opt="$requested_engine" package client label
+  [[ "$opt" == "mariadb" ]] && opt="1"
+  [[ "$opt" == "mysql" ]] && opt="2"
+  if [[ -z "$opt" ]]; then
+    msg_section "Instalar motor SQL"
+    echo "  1) MariaDB Server      — recomendado para Debian; instalación nativa"
+    echo "  2) MySQL Community     — requiere paquete mysql-server en los repositorios activos"
+    echo "  0) Cancelar"
+    echo
+    read -rp "  Opción: " opt
+  fi
   case "$opt" in
     1) package="mariadb-server"; client="mariadb-client"; label="MariaDB" ;;
     2) package="mysql-server";   client="mysql-client";   label="MySQL Community" ;;
@@ -1807,7 +1837,7 @@ install_mariadb() {
   esac
 
   msg_info "[1/3] Actualizando repositorios..."
-  apt-get update
+  apt-get update || return 1
   if ! apt-cache show "$package" >/dev/null 2>&1; then
     msg_error "El paquete ${package} no está disponible en los repositorios configurados."
     if [[ "$package" == "mysql-server" ]]; then
@@ -1818,11 +1848,11 @@ install_mariadb() {
     return 1
   fi
   msg_info "[2/3] Instalando ${label}..."
-  DEBIAN_FRONTEND=noninteractive apt-get install -y "$package" "$client"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "$package" "$client" || return 1
   service="$(db_service)"
   [[ -n "$service" ]] || { msg_error "No se pudo detectar el servicio SQL instalado."; return 1; }
   msg_info "[3/3] Habilitando servicio..."
-  systemctl enable --now "$service"
+  systemctl enable --now "$service" || return 1
   echo
   msg_ok "$(db_label) instalado y habilitado."
   msg_info "Siguiente paso recomendado: mysql_secure_installation"
@@ -2638,8 +2668,8 @@ cf_install() {
     return 0
   fi
   msg_info "Instalando desde el repositorio APT firmado de Cloudflare..."
-  apt-get install -y ca-certificates curl gnupg
-  install -d -m 0755 /usr/share/keyrings /etc/apt/sources.list.d
+  apt-get install -y ca-certificates curl gnupg || return 1
+  install -d -m 0755 /usr/share/keyrings /etc/apt/sources.list.d || return 1
 
   local key_tmp key_dearmored
   key_tmp="$(mktemp)"
@@ -2655,15 +2685,18 @@ cf_install() {
     msg_error "La clave descargada no tiene un formato OpenPGP válido."
     return 1
   fi
-  install -o root -g root -m 0644 "$key_dearmored" "$CLOUDFLARED_KEYRING"
+  install -o root -g root -m 0644 "$key_dearmored" "$CLOUDFLARED_KEYRING" || {
+    rm -f "$key_tmp" "$key_dearmored"
+    return 1
+  }
   rm -f "$key_tmp" "$key_dearmored"
 
   cat > "$CLOUDFLARED_APT_SOURCE" <<EOF
 deb [signed-by=${CLOUDFLARED_KEYRING}] https://pkg.cloudflare.com/cloudflared any main
 EOF
-  chmod 0644 "$CLOUDFLARED_APT_SOURCE"
-  apt-get update
-  apt-get install -y cloudflared
+  chmod 0644 "$CLOUDFLARED_APT_SOURCE" || return 1
+  apt-get update || return 1
+  apt-get install -y cloudflared || return 1
   msg_ok "cloudflared instalado: $(cloudflared --version 2>&1 | head -1)"
 }
 
@@ -2679,31 +2712,31 @@ cf_login() {
 ensure_cloudflared_identity() {
   if ! id cloudflared >/dev/null 2>&1; then
     useradd --system --user-group --home-dir /var/lib/cloudflared --create-home \
-      --shell /usr/sbin/nologin cloudflared
+      --shell /usr/sbin/nologin cloudflared || return 1
   fi
-  install -d -o root -g cloudflared -m 0750 "$CLOUDFLARED_DIR"
-  install -d -o cloudflared -g cloudflared -m 0700 /var/lib/cloudflared
+  install -d -o root -g cloudflared -m 0750 "$CLOUDFLARED_DIR" || return 1
+  install -d -o cloudflared -g cloudflared -m 0700 /var/lib/cloudflared || return 1
 }
 
 cf_prepare_credentials() {
   local uuid="$1" source_file="$2"
-  ensure_cloudflared_identity
+  ensure_cloudflared_identity || return 1
   local target="${CLOUDFLARED_DIR}/${uuid}.json"
   if [[ "$(realpath "$source_file")" != "$(realpath -m "$target")" ]]; then
-    install -o root -g cloudflared -m 0640 "$source_file" "$target"
+    install -o root -g cloudflared -m 0640 "$source_file" "$target" || return 1
   else
-    chown root:cloudflared "$target"
-    chmod 0640 "$target"
+    chown root:cloudflared "$target" || return 1
+    chmod 0640 "$target" || return 1
   fi
   printf '%s\n' "$target"
 }
 
 cf_write_systemd_unit() {
   local unit_file="/etc/systemd/system/cloudflared.service"
-  ensure_cloudflared_identity
-  chown root:cloudflared "$CLOUDFLARED_CONFIG"
-  chmod 0640 "$CLOUDFLARED_CONFIG"
-  cat > "$unit_file" <<'UNIT'
+  ensure_cloudflared_identity || return 1
+  chown root:cloudflared "$CLOUDFLARED_CONFIG" || return 1
+  chmod 0640 "$CLOUDFLARED_CONFIG" || return 1
+  if ! cat > "$unit_file" <<'UNIT'
 [Unit]
 Description=cloudflared
 After=network-online.target
@@ -2738,8 +2771,12 @@ ReadWritePaths=/var/lib/cloudflared
 [Install]
 WantedBy=multi-user.target
 UNIT
-  systemctl daemon-reload
-  systemctl enable --now cloudflared
+  then
+    msg_error "No se pudo escribir el servicio systemd de cloudflared."
+    return 1
+  fi
+  systemctl daemon-reload || return 1
+  systemctl enable --now cloudflared || return 1
   msg_ok "Unit file escrito en modo config.yml."
   msg_ok "Servicio iniciado."
 }
@@ -2798,19 +2835,24 @@ _cf_build_config() {
 "
   fi
 
-  [[ -f "$CLOUDFLARED_CONFIG" ]] \
-    && cp "$CLOUDFLARED_CONFIG" "${CLOUDFLARED_CONFIG}.bak.$(date +%F-%H%M%S)"
+  if [[ -f "$CLOUDFLARED_CONFIG" ]]; then
+    cp "$CLOUDFLARED_CONFIG" "${CLOUDFLARED_CONFIG}.bak.$(date +%F-%H%M%S)" || return 1
+  fi
 
-  ensure_cloudflared_identity
-  cat > "$CLOUDFLARED_CONFIG" <<EOF
+  ensure_cloudflared_identity || return 1
+  if ! cat > "$CLOUDFLARED_CONFIG" <<EOF
 tunnel: ${uuid}
 credentials-file: ${creds_file}
 
 ingress:
 ${ingress_blocks}  - service: http_status:404
 EOF
-  chown root:cloudflared "$CLOUDFLARED_CONFIG"
-  chmod 0640 "$CLOUDFLARED_CONFIG"
+  then
+    msg_error "No se pudo escribir ${CLOUDFLARED_CONFIG}."
+    return 1
+  fi
+  chown root:cloudflared "$CLOUDFLARED_CONFIG" || return 1
+  chmod 0640 "$CLOUDFLARED_CONFIG" || return 1
 
   msg_ok "config.yml escrito: ${CLOUDFLARED_CONFIG}"
   echo; cat "$CLOUDFLARED_CONFIG"; echo
@@ -2886,13 +2928,17 @@ cf_create_tunnel() {
   fi
   msg_ok "Credenciales: ${creds_file}"
 
-  creds_file="$(cf_prepare_credentials "$uuid" "$creds_file")"
+  creds_file="$(cf_prepare_credentials "$uuid" "$creds_file")" || return 1
   msg_ok "Credenciales protegidas para el servicio: ${creds_file}"
 
-  _cf_build_config "$uuid" "$creds_file" "$tunnel_name"
+  _cf_build_config "$uuid" "$creds_file" "$tunnel_name" || return 1
 
   prompt_yes_no "¿Instalar/actualizar cloudflared como servicio systemd?" "s"
-  [[ "$REPLY_YESNO" == "s" ]] && cf_write_systemd_unit
+  if [[ "$REPLY_YESNO" == "s" ]]; then
+    cf_write_systemd_unit || return 1
+  else
+    msg_info "Tunnel configurado; el servicio quedó pendiente de instalación."
+  fi
 }
 
 cf_regen_config() {
@@ -5910,6 +5956,229 @@ menu_sistema() {
 # MENÚ PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════════════
 
+header_bootstrap() {
+  echo -e "${BOLD}${BLUE}╔══════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${BLUE}║${WHITE}  [ A ] Puesta en marcha guiada             ${BLUE}║${RESET}"
+  echo -e "${BOLD}${BLUE}╚══════════════════════════════════════════════╝${RESET}"
+}
+
+bootstrap_prompt_toggle() {
+  local label="$1" default="${2:-1}" choice=""
+  echo
+  echo "  ${label}"
+  echo "  1) Sí"
+  echo "  2) No"
+  echo "  0) Cancelar el asistente"
+  echo
+  while true; do
+    read -rp "  Opción [${default}]: " choice
+    choice="${choice:-$default}"
+    case "$choice" in
+      1) REPLY_YESNO="s"; return 0 ;;
+      2) REPLY_YESNO="n"; return 0 ;;
+      0) return 130 ;;
+      *) msg_error "Opción inválida." ;;
+    esac
+  done
+}
+
+bootstrap_choose_database() {
+  local choice=""
+  echo
+  echo "  Motor de base de datos:"
+  echo "  1) MariaDB Server  — recomendado y nativo en Debian"
+  echo "  2) MySQL Community — requiere que mysql-server esté disponible"
+  echo "  3) Ninguno         — landing page o servidor sin base de datos"
+  echo "  0) Cancelar el asistente"
+  echo
+  while true; do
+    read -rp "  Opción [1]: " choice
+    choice="${choice:-1}"
+    case "$choice" in
+      1) BOOTSTRAP_DB_ENGINE="mariadb"; return 0 ;;
+      2) BOOTSTRAP_DB_ENGINE="mysql"; return 0 ;;
+      3) BOOTSTRAP_DB_ENGINE="none"; return 0 ;;
+      0) return 130 ;;
+      *) msg_error "Opción inválida." ;;
+    esac
+  done
+}
+
+bootstrap_choose_cloudflare_mode() {
+  local choice=""
+  echo
+  echo "  Configuración de Cloudflare Tunnel:"
+  echo "  1) Completa — paquete, autenticación, tunnel, config.yml y servicio"
+  echo "  2) Solo instalar el paquete cloudflared"
+  echo "  3) Omitir Cloudflare"
+  echo "  0) Cancelar el asistente"
+  echo
+  while true; do
+    read -rp "  Opción [1]: " choice
+    choice="${choice:-1}"
+    case "$choice" in
+      1) BOOTSTRAP_CF_MODE="complete"; return 0 ;;
+      2) BOOTSTRAP_CF_MODE="package"; return 0 ;;
+      3) BOOTSTRAP_CF_MODE="none"; return 0 ;;
+      0) return 130 ;;
+      *) msg_error "Opción inválida." ;;
+    esac
+  done
+}
+
+bootstrap_cloudflare_complete() {
+  cf_install || return 1
+
+  if [[ -f "$CLOUDFLARED_CONFIG" ]]; then
+    msg_ok "Ya existe ${CLOUDFLARED_CONFIG}; se conservará la configuración actual."
+    cf_write_systemd_unit
+    return $?
+  fi
+
+  if [[ ! -f /root/.cloudflared/cert.pem ]]; then
+    echo
+    msg_info "Cloudflare requiere una autorización interactiva en el navegador."
+    cf_login || return 1
+  else
+    msg_ok "Autenticación de Cloudflare detectada."
+  fi
+
+  cf_create_tunnel
+}
+
+BOOTSTRAP_FAILURES=0
+BOOTSTRAP_COMPLETED=0
+
+bootstrap_run_step() {
+  local label="$1"; shift
+  echo
+  msg_section "$label"
+  if "$@"; then
+    ((BOOTSTRAP_COMPLETED++)) || true
+    msg_ok "Etapa completada: ${label}"
+  else
+    ((BOOTSTRAP_FAILURES++)) || true
+    msg_error "Etapa fallida: ${label}"
+  fi
+}
+
+bootstrap_environment() {
+  msg_section "Puesta en marcha guiada del servidor"
+  echo "  Este asistente puede preparar el stack web, el motor SQL, Cloudflare"
+  echo "  Tunnel y el blindaje del sistema en una sola ejecución."
+  echo
+  msg_warn "Antes del blindaje mantén abierta una segunda sesión SSH y un snapshot reciente."
+  echo
+  echo "  1) Perfil completo recomendado"
+  echo "     Nginx + PHP-FPM + SQL a elección + Cloudflare completo + seguridad"
+  echo "  2) Perfil personalizado"
+  echo "     Permite incluir u omitir cada componente"
+  echo "  0) Cancelar"
+  echo
+
+  local profile="" web_enabled="s" security_enabled="s"
+  local selected_php="" cf_label="" db_label_selected=""
+  BOOTSTRAP_DB_ENGINE="none"
+  BOOTSTRAP_CF_MODE="complete"
+
+  while true; do
+    read -rp "  Opción [1]: " profile
+    profile="${profile:-1}"
+    case "$profile" in
+      1|2) break ;;
+      0) msg_warn "Asistente cancelado. No se realizaron cambios."; return 0 ;;
+      *) msg_error "Opción inválida." ;;
+    esac
+  done
+
+  if [[ "$profile" == "2" ]]; then
+    bootstrap_prompt_toggle "¿Instalar el stack web completo (Nginx + PHP-FPM + extensiones)?" "1" \
+      || { msg_warn "Asistente cancelado."; return 0; }
+    web_enabled="$REPLY_YESNO"
+    bootstrap_choose_cloudflare_mode \
+      || { msg_warn "Asistente cancelado."; return 0; }
+    bootstrap_prompt_toggle "¿Ejecutar el blindaje completo de seguridad?" "1" \
+      || { msg_warn "Asistente cancelado."; return 0; }
+    security_enabled="$REPLY_YESNO"
+  fi
+
+  bootstrap_choose_database \
+    || { msg_warn "Asistente cancelado. No se realizaron cambios."; return 0; }
+
+  if [[ "$web_enabled" == "s" ]]; then
+    msg_info "Selecciona la versión PHP para el stack web:"
+    select_php_version "install" \
+      || { msg_warn "Asistente cancelado. No se realizaron cambios."; return 0; }
+    selected_php="$PHP_VERSION"
+  fi
+
+  case "$BOOTSTRAP_CF_MODE" in
+    complete) cf_label="Completa (autenticación + tunnel + servicio)" ;;
+    package)  cf_label="Solo paquete cloudflared" ;;
+    none)     cf_label="Omitida" ;;
+  esac
+  case "$BOOTSTRAP_DB_ENGINE" in
+    mariadb) db_label_selected="MariaDB Server" ;;
+    mysql)   db_label_selected="MySQL Community" ;;
+    none)    db_label_selected="Sin base de datos" ;;
+  esac
+
+  echo
+  echo -e "${BOLD}${CYAN}  Plan de puesta en marcha${RESET}"
+  echo
+  printf '  %-24s %s\n' "Stack web:" \
+    "$([[ "$web_enabled" == "s" ]] && echo "Nginx + PHP ${selected_php}-FPM" || echo "Omitido")"
+  printf '  %-24s %s\n' "Base de datos:" "$db_label_selected"
+  printf '  %-24s %s\n' "Cloudflare:" "$cf_label"
+  printf '  %-24s %s\n' "Seguridad:" \
+    "$([[ "$security_enabled" == "s" ]] && echo "Blindaje completo" || echo "Omitida")"
+  echo
+  echo "  1) Ejecutar este plan"
+  echo "  0) Cancelar sin realizar cambios"
+  echo
+  local confirm=""
+  while true; do
+    read -rp "  Opción [1]: " confirm
+    confirm="${confirm:-1}"
+    case "$confirm" in
+      1) break ;;
+      0) msg_warn "Asistente cancelado. No se realizaron cambios."; return 0 ;;
+      *) msg_error "Opción inválida." ;;
+    esac
+  done
+
+  BOOTSTRAP_FAILURES=0
+  BOOTSTRAP_COMPLETED=0
+
+  if [[ "$web_enabled" == "s" ]]; then
+    bootstrap_run_step "Stack web" install_base_stack "n" "$selected_php"
+  fi
+  if [[ "$BOOTSTRAP_DB_ENGINE" != "none" ]]; then
+    bootstrap_run_step "Motor SQL: ${db_label_selected}" install_mariadb "$BOOTSTRAP_DB_ENGINE"
+  fi
+  case "$BOOTSTRAP_CF_MODE" in
+    complete) bootstrap_run_step "Cloudflare Tunnel completo" bootstrap_cloudflare_complete ;;
+    package)  bootstrap_run_step "Paquete cloudflared" cf_install ;;
+  esac
+  if [[ "$security_enabled" == "s" ]]; then
+    bootstrap_run_step "Blindaje completo" sec_harden_all
+  fi
+
+  echo
+  msg_section "Resultado de la puesta en marcha"
+  printf '  %-28s %s\n' "Etapas completadas:" "$BOOTSTRAP_COMPLETED"
+  printf '  %-28s %s\n' "Etapas con error:" "$BOOTSTRAP_FAILURES"
+  echo
+  if (( BOOTSTRAP_FAILURES > 0 )); then
+    msg_error "La puesta en marcha quedó incompleta. Revisa los errores anteriores."
+    msg_info "Puedes repetir el asistente: las instalaciones son idempotentes y conservarán la configuración válida."
+    return 1
+  fi
+
+  msg_ok "Puesta en marcha completada."
+  msg_info "Siguiente paso: crea el sitio, configura el despliegue Git y ejecuta Estado/Auditoría."
+}
+
 isolation_summary() {
   local total=0 isolated=0 dir site runtime_user
   while IFS= read -r dir; do
@@ -5978,6 +6247,8 @@ main_menu() {
       && echo -e "  ${DIM}(privacidad: exporta DEVLAB_SHOW_PUBLIC_IP=s para consultarla)${RESET}"
     echo
 
+    echo -e "  ${BLUE}A)${RESET} ${BOLD}Puesta en marcha${RESET} — Instalación guiada del entorno completo"
+    echo
     echo -e "  ${CYAN}1)${RESET} ${BOLD}Stack Web${RESET}      — Nginx, PHP-FPM, sitios"
     echo -e "  ${MAGENTA}2)${RESET} ${BOLD}MySQL / MariaDB${RESET} — Instalación, bases, usuarios"
     echo -e "  ${YELLOW}3)${RESET} ${BOLD}Cloudflare${RESET}     — Tunnel, config, DNS"
@@ -5989,9 +6260,10 @@ main_menu() {
     echo -e "  ${WHITE}9)${RESET} ${BOLD}Estado${RESET}         — Resumen estático de servicios"
     echo -e "  ${WHITE}0)${RESET} Salir"
     echo
-    read -rp "  Selecciona [0-9] (m = monitor): " opt; echo
+    read -rp "  Selecciona [0-9, A] (m = monitor): " opt; echo
 
     case "$opt" in
+      a|A) run_item header_bootstrap bootstrap_environment ;;
       1) menu_web_stack    || true ;;
       2) menu_mariadb      || true ;;
       3) menu_cloudflared  || true ;;
