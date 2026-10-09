@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  DevLab Manager v2.4 - Marcos Espinoza Torres
+#  DevLab Manager v2.5 - Marcos Espinoza Torres
 #  Stack completo: Nginx · PHP-FPM · MySQL/MariaDB · Cloudflared | Debian 12/13
 # ==============================================================================
 set -euo pipefail
@@ -9,7 +9,7 @@ set -euo pipefail
 # que necesitan lectura de Nginx/PHP abren permisos de forma explícita después.
 umask 077
 
-readonly SCRIPT_VERSION="2.4 - Marcos Espinoza Torres"
+readonly SCRIPT_VERSION="2.5 - Marcos Espinoza Torres"
 readonly CATCH_ALL_FILE="/etc/nginx/sites-available/000-catch-all"
 readonly MARIADB_CNF="/etc/mysql/mariadb.conf.d/50-server.cnf"
 readonly MYSQL_CNF="/etc/mysql/mysql.conf.d/mysqld.cnf"
@@ -5598,10 +5598,55 @@ _git_pull_dir() {
   # a scripts versionados. No toca el contenido ni oculta cambios reales.
   _git_restore_tracked_exec_modes "$site_dir"
 
-  if [[ -n "$(git -C "$site_dir" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
-    msg_error "Hay cambios locales en archivos versionados. Se cancela para no sobrescribirlos."
-    git -C "$site_dir" status --short --untracked-files=no | sed 's/^/    /'
-    return 1
+  local estado_local
+  estado_local="$(git -C "$site_dir" status --porcelain 2>/dev/null)"
+  if [[ -n "$estado_local" ]]; then
+    msg_warn "Hay cambios locales (versionados o archivos nuevos):"
+    git -C "$site_dir" status --short | sed 's/^/    /'
+    echo
+    echo "  1) Respaldar los cambios en un stash y continuar el pull"
+    echo "  2) Mostrar las diferencias y cancelar"
+    echo "  0) Cancelar sin modificar nada"
+    echo
+
+    local opcion_cambios
+    read -rp "  Opción: " opcion_cambios
+    case "$opcion_cambios" in
+      1)
+        local mensaje_stash="devlab-auto ${site} $(date '+%Y-%m-%d %H:%M:%S')"
+        if ! git -C "$site_dir" stash push --include-untracked -m "$mensaje_stash" 2>&1; then
+          msg_error "No fue posible respaldar los cambios locales. Pull cancelado."
+          return 1
+        fi
+        if [[ -n "$(git -C "$site_dir" status --porcelain 2>/dev/null)" ]]; then
+          msg_error "El repositorio continúa con cambios locales. Pull cancelado."
+          return 1
+        fi
+        msg_ok "Cambios respaldados en stash: ${mensaje_stash}"
+        msg_info "No se restaurarán automáticamente después del pull."
+        ;;
+      2)
+        echo
+        git -C "$site_dir" diff --stat
+        git -C "$site_dir" diff
+        if ! git -C "$site_dir" diff --cached --quiet; then
+          echo
+          msg_info "Cambios preparados en el índice:"
+          git -C "$site_dir" diff --cached --stat
+          git -C "$site_dir" diff --cached
+        fi
+        msg_warn "Pull cancelado para que pueda revisar las diferencias."
+        return 1
+        ;;
+      0)
+        msg_warn "Pull cancelado sin modificar el repositorio."
+        return 1
+        ;;
+      *)
+        msg_error "Opción inválida. Pull cancelado."
+        return 1
+        ;;
+    esac
   fi
 
   msg_info "Branch: ${branch} — fetch + avance fast-forward únicamente..."
