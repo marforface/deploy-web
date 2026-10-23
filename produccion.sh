@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  DevLab Manager v2.5 - Marcos Espinoza Torres
+#  DevLab Manager v2.6 - Marcos Espinoza Torres
 #  Stack completo: Nginx · PHP-FPM · MySQL/MariaDB · Cloudflared | Debian 12/13
 # ==============================================================================
 set -euo pipefail
@@ -9,7 +9,7 @@ set -euo pipefail
 # que necesitan lectura de Nginx/PHP abren permisos de forma explícita después.
 umask 077
 
-readonly SCRIPT_VERSION="2.5 - Marcos Espinoza Torres"
+readonly SCRIPT_VERSION="2.6 - Marcos Espinoza Torres"
 readonly CATCH_ALL_FILE="/etc/nginx/sites-available/000-catch-all"
 readonly MARIADB_CNF="/etc/mysql/mariadb.conf.d/50-server.cnf"
 readonly MYSQL_CNF="/etc/mysql/mysql.conf.d/mysqld.cnf"
@@ -17,7 +17,14 @@ readonly MYSQL_OVERRIDE_CNF="/etc/mysql/mysql.conf.d/99-devlab-manager.cnf"
 readonly MARIADB_BACKUP_DIR="/var/backups/mariadb"
 readonly MYSQL_BACKUP_DIR="/var/backups/mysql"
 readonly SESSION_OPTIONS=(2 4 8 16 24)
-readonly PHP_SUPPORTED_VERSIONS=(8.1 8.2 8.3 8.4)
+# Política de versiones PHP (fuente: php.net/supported-versions.php y boletines).
+# Solo se ofrecen ramas con soporte de seguridad; PHP_MIN_SAFE es la primera
+# versión que corrige el último boletín crítico. Actualizar ante cada boletín.
+readonly PHP_SECURITY_REF="CVE-2026-109618 / CVE-2026-109619 (php.net, 21-oct-2026)"
+readonly PHP_SUPPORTED_VERSIONS=(8.2 8.3 8.4 8.5)
+readonly PHP_RECOMMENDED_VERSION="8.4"
+declare -rA PHP_MIN_SAFE=([8.2]=8.2.35 [8.3]=8.3.36 [8.4]=8.4.27 [8.5]=8.5.12)
+declare -rA PHP_EOL_DATE=([8.2]=2026-12-31 [8.3]=2027-12-31 [8.4]=2028-12-31 [8.5]=2029-12-31)
 readonly CLOUDFLARED_CONFIG="/etc/cloudflared/config.yml"
 readonly CLOUDFLARED_DIR="/etc/cloudflared"
 readonly GIT_DEPLOY_KEY="/root/.ssh/deploy_ed25519"
@@ -316,14 +323,21 @@ select_php_version() {
 
   echo
   msg_section "$label"
+  [[ "$mode" == "install" ]] \
+    && msg_info "Solo se ofrecen ramas con soporte de seguridad (${PHP_SECURITY_REF})."
   for ver in "${versions[@]}"; do
-    local mark=""
-    dpkg -s "php${ver}-fpm" >/dev/null 2>&1 \
-      && mark=" ${GREEN}[instalada]${RESET}" || mark=""
+    local mark="" st
+    if dpkg -s "php${ver}-fpm" >/dev/null 2>&1; then
+      st="$(php_branch_status "$ver" "$(php_installed_pkg_version "$ver" || true)")"
+      mark=" ${GREEN}[instalada]${RESET} $(php_status_label "$st")"
+    fi
+    if [[ "$mode" == "install" ]]; then
+      [[ "$ver" == "$PHP_RECOMMENDED_VERSION" ]] && mark=" ${GREEN}(recomendada)${RESET}${mark}"
+      mark=" — mínimo ${PHP_MIN_SAFE[$ver]}, soporte hasta ${PHP_EOL_DATE[$ver]}${mark}"
+    fi
     printf "  %d) PHP %s%b\n" "$i" "$ver" "$mark"
     ((i++))
   done
-  [[ "$mode" == "install" ]] && echo "  $i) Otra versión (manual)"
   echo "  0) Cancelar"; echo
 
   while true; do
@@ -332,21 +346,17 @@ select_php_version() {
     if [[ "$opt" =~ ^[1-9][0-9]*$ ]] && (( opt >= 1 && opt <= ${#versions[@]} )); then
       chosen="${versions[$((opt-1))]}"; break
     fi
-    if [[ "$mode" == "install" ]] && (( opt == ${#versions[@]} + 1 )); then
-      while true; do
-        read -rp "  Versión PHP (ej: 8.5): " chosen
-        if [[ "$chosen" =~ ^[0-9]+\.[0-9]+$ ]]; then
-          msg_warn "Versión '${chosen}' manual. Asegúrate de que Sury la soporte."; break
-        fi
-        msg_error "Formato inválido. Usa X.Y"
-      done
-      break
-    fi
     msg_error "Opción inválida."
   done
 
+  if [[ "$mode" == "install" ]] && ! php_branch_supported "$chosen"; then
+    msg_error "PHP ${chosen} no tiene soporte de seguridad; no se instalará."
+    return 1
+  fi
   PHP_VERSION="$chosen"
   msg_ok "Versión PHP seleccionada: ${PHP_VERSION}"
+  [[ "$(php_branch_status "$chosen" "$(php_installed_pkg_version "$chosen" || true)")" == "eol" ]] \
+    && msg_warn "PHP ${chosen} está fuera de soporte: migra sus sitios (Stack Web → 17)."
   return 0
 }
 
@@ -379,6 +389,464 @@ show_php_status() {
   if command -v php >/dev/null 2>&1; then
     msg_info "php CLI sistema: $(php -r 'echo PHP_VERSION;' 2>/dev/null)"
   fi
+  echo
+  msg_info "Detalle de parches y soporte: Stack Web → 15 (Auditoría de seguridad PHP)."
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEGURIDAD DE VERSIONES PHP
+# La política vive en PHP_SUPPORTED_VERSIONS / PHP_MIN_SAFE / PHP_EOL_DATE.
+# Ante cada boletín de php.net basta con actualizar esas tablas.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Versión upstream (X.Y.Z) a partir de una versión Debian/Sury:
+# "2:8.4.27-1+0~20261021.1+debian12~1.gbp1" → "8.4.27"
+php_upstream_version() {
+  local v="${1#*:}"
+  v="${v%%[-+~]*}"
+  printf '%s' "$v"
+}
+
+php_installed_pkg_version() {
+  local ver="$1" pkg raw
+  for pkg in "php${ver}-fpm" "php${ver}-cli"; do
+    raw="$(dpkg-query -W -f='${db:Status-Abbrev} ${Version}' "$pkg" 2>/dev/null || true)"
+    if [[ "$raw" == ii* ]]; then
+      php_upstream_version "${raw##* }"
+      return 0
+    fi
+  done
+  return 1
+}
+
+php_candidate_pkg_version() {
+  local ver="$1" cand
+  cand="$(apt-cache policy "php${ver}-fpm" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+  [[ -n "$cand" && "$cand" != "(none)" ]] || return 1
+  php_upstream_version "$cand"
+}
+
+php_branch_supported() {
+  local ver="$1" v
+  for v in "${PHP_SUPPORTED_VERSIONS[@]}"; do [[ "$v" == "$ver" ]] && return 0; done
+  return 1
+}
+
+# Estado de una rama dada su versión upstream instalada:
+#   safe | vulnerable | eol | unknown
+php_branch_status() {
+  local ver="$1" upstream="${2:-}"
+  local min="${PHP_MIN_SAFE[$ver]:-}" eol="${PHP_EOL_DATE[$ver]:-}"
+  if [[ -z "$min" || -z "$eol" ]] || ! php_branch_supported "$ver"; then
+    echo "eol"; return 0
+  fi
+  [[ "$(date +%F)" > "$eol" ]] && { echo "eol"; return 0; }
+  [[ -n "$upstream" ]] || { echo "unknown"; return 0; }
+  if dpkg --compare-versions "$upstream" ge "$min"; then
+    echo "safe"
+  else
+    echo "vulnerable"
+  fi
+}
+
+php_status_label() {
+  case "$1" in
+    safe)       printf '%s' "${GREEN}✔ seguro${RESET}" ;;
+    vulnerable) printf '%s' "${RED}✖ VULNERABLE${RESET}" ;;
+    eol)        printf '%s' "${RED}✖ SIN SOPORTE (EOL)${RESET}" ;;
+    *)          printf '%s' "${YELLOW}? desconocido${RESET}" ;;
+  esac
+}
+
+php_branch_sites() {
+  local ver="$1" f
+  for f in "/etc/php/${ver}/fpm/pool.d/${DEVLAB_POOL_PREFIX}"*.conf; do
+    [[ -f "$f" ]] || continue
+    f="${f##*/}"; f="${f#"${DEVLAB_POOL_PREFIX}"}"
+    printf '%s\n' "${f%.conf}"
+  done
+}
+
+# Resumen rápido para el menú principal (solo dpkg, sin red).
+php_security_banner() {
+  local ver up st bad=()
+  while IFS= read -r ver; do
+    [[ -n "$ver" ]] || continue
+    up="$(php_installed_pkg_version "$ver" || true)"
+    st="$(php_branch_status "$ver" "$up")"
+    case "$st" in
+      vulnerable) bad+=("${ver} (${up:-?})") ;;
+      eol)        bad+=("${ver} EOL") ;;
+    esac
+  done < <(detect_installed_php_versions)
+  (( ${#bad[@]} == 0 )) && return 0
+  local joined
+  joined="$(printf '%s, ' "${bad[@]}")"
+  echo -e "  ${RED}${BOLD}⚠ PHP inseguro: ${joined%, } — Stack Web → 15 (auditar) / 16 (actualizar)${RESET}"
+}
+
+php_security_audit() {
+  msg_section "Auditoría de seguridad PHP"
+  msg_info "Referencia: ${PHP_SECURITY_REF}"
+  echo
+  printf '  %-6s %-12s %-12s %-12s %-24s %s\n' "RAMA" "INSTALADA" "EN APT" "MÍNIMO" "ESTADO" "SITIOS"
+  printf '  %s\n' "$(printf '─%.0s' {1..92})"
+
+  local installed=() ver up cand min st sites issues=0 pending_repo=0
+  mapfile -t installed < <(detect_installed_php_versions)
+  if [[ -z "${installed[0]:-}" ]]; then
+    msg_warn "No se detectaron versiones PHP-FPM instaladas."
+    return 0
+  fi
+
+  for ver in "${installed[@]}"; do
+    [[ -n "$ver" ]] || continue
+    up="$(php_installed_pkg_version "$ver" || true)"
+    cand="$(php_candidate_pkg_version "$ver" || true)"
+    min="${PHP_MIN_SAFE[$ver]:-—}"
+    st="$(php_branch_status "$ver" "$up")"
+    sites="$(php_branch_sites "$ver" | paste -sd, -)"
+    printf '  %-6s %-12s %-12s %-12s %-35b %s\n' \
+      "$ver" "${up:-?}" "${cand:-—}" "$min" "$(php_status_label "$st")" "${sites:-—}"
+    [[ "$st" == "safe" ]] && continue
+    ((issues++)) || true
+    if [[ "$st" == "vulnerable" && -n "$cand" ]] \
+       && ! dpkg --compare-versions "$cand" ge "$min"; then
+      ((pending_repo++)) || true
+    fi
+  done
+
+  echo
+  if (( issues == 0 )); then
+    msg_ok "Todas las ramas PHP instaladas están parcheadas y con soporte."
+    return 0
+  fi
+  msg_warn "${issues} rama(s) requieren acción:"
+  echo "    • Vulnerable con parche disponible → Stack Web → 16 (Actualizar PHP instalado)"
+  echo "    • Rama EOL (p. ej. 8.1)            → Stack Web → 17 (Migrar sitios a otra rama)"
+  if (( pending_repo > 0 )); then
+    msg_warn "El repositorio aún no ofrece la versión parcheada para ${pending_repo} rama(s)."
+    echo "    • Aplica la mitigación temporal (Stack Web → 18) y reintenta más tarde."
+  fi
+  msg_info "'EN APT' se consulta con la caché local; la opción 16 ejecuta apt-get update antes."
+  return 1
+}
+
+# Paquetes phpX.Y-* instalados (estado ii).
+php_branch_installed_pkgs() {
+  local ver="$1"
+  dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' "php${ver}-*" 2>/dev/null \
+    | awk '$1 == "ii" {print $2}'
+}
+
+# Elige una rama instalada o "all". Deja el resultado en REPLY_PHP_BRANCH.
+REPLY_PHP_BRANCH=""
+php_choose_installed_branch() {
+  local allow_all="${1:-n}" installed=() i=1 opt ver
+  mapfile -t installed < <(detect_installed_php_versions)
+  if [[ -z "${installed[0]:-}" ]]; then
+    msg_warn "No hay versiones PHP-FPM instaladas."
+    return 1
+  fi
+  for ver in "${installed[@]}"; do
+    printf '  %d) PHP %s  (%s)\n' "$i" "$ver" "$(php_installed_pkg_version "$ver" || echo '?')"
+    ((i++))
+  done
+  [[ "$allow_all" == "s" ]] && echo "  a) Todas las ramas instaladas"
+  echo "  0) Cancelar"; echo
+  while true; do
+    read -rp "  Opción: " opt
+    [[ "$opt" == "0" ]] && return 1
+    if [[ "$allow_all" == "s" && "${opt,,}" == "a" ]]; then
+      REPLY_PHP_BRANCH="all"; return 0
+    fi
+    if [[ "$opt" =~ ^[1-9][0-9]*$ ]] && (( opt <= ${#installed[@]} )); then
+      REPLY_PHP_BRANCH="${installed[$((opt-1))]}"; return 0
+    fi
+    msg_error "Opción inválida."
+  done
+}
+
+php_restart_branch() {
+  local ver="$1"
+  if ! "php-fpm${ver}" -t >/dev/null 2>&1; then
+    msg_error "php-fpm${ver} -t falló; no se reinicia para no tumbar los sitios."
+    "php-fpm${ver}" -t 2>&1 | sed 's/^/    /' | tail -n 5
+    return 1
+  fi
+  systemctl restart "php${ver}-fpm" || return 1
+  sleep 1
+  systemctl is-active --quiet "php${ver}-fpm" || {
+    msg_error "php${ver}-fpm no quedó activo. Revisa: journalctl -u php${ver}-fpm"
+    return 1
+  }
+  msg_ok "php${ver}-fpm reiniciado y activo."
+}
+
+php_update_installed() {
+  msg_section "Actualizar PHP instalado a la última versión parcheada"
+  msg_info "Selecciona la rama a actualizar:"
+  echo
+  php_choose_installed_branch "s" || { msg_warn "Operación cancelada."; return 0; }
+
+  local branches=() ver
+  if [[ "$REPLY_PHP_BRANCH" == "all" ]]; then
+    mapfile -t branches < <(detect_installed_php_versions)
+  else
+    branches=("$REPLY_PHP_BRANCH")
+  fi
+
+  msg_warn "Se reiniciará PHP-FPM de cada rama actualizada (corte de pocos segundos)."
+  prompt_yes_no "¿Continuar?" "s"
+  [[ "$REPLY_YESNO" == "s" ]] || { msg_warn "Operación cancelada."; return 0; }
+
+  msg_info "Actualizando índices de paquetes..."
+  apt-get update || { msg_error "apt-get update falló."; return 1; }
+
+  local failed=0 before after st pkgs=()
+  for ver in "${branches[@]}"; do
+    [[ -n "$ver" ]] || continue
+    echo; echo -e "  ${BOLD}── PHP ${ver} ──${RESET}"
+    mapfile -t pkgs < <(php_branch_installed_pkgs "$ver")
+    if [[ -z "${pkgs[0]:-}" ]]; then
+      msg_warn "Sin paquetes php${ver}-* instalados; se omite."; continue
+    fi
+    before="$(php_installed_pkg_version "$ver" || echo '?')"
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade \
+         -o Dpkg::Options::=--force-confold "${pkgs[@]}"; then
+      msg_error "apt-get falló al actualizar PHP ${ver}."
+      ((failed++)) || true; continue
+    fi
+    php_restart_branch "$ver" || { ((failed++)) || true; continue; }
+    after="$(php_installed_pkg_version "$ver" || echo '?')"
+    st="$(php_branch_status "$ver" "$after")"
+    printf '  %s → %s  %b\n' "$before" "$after" "$(php_status_label "$st")"
+    case "$st" in
+      vulnerable)
+        msg_warn "El repositorio aún no publica ${PHP_MIN_SAFE[$ver]:-la versión parcheada} para ${ver}."
+        msg_info "Aplica la mitigación temporal (Stack Web → 18) y reintenta más tarde."
+        ((failed++)) || true ;;
+      eol)
+        msg_warn "PHP ${ver} no tiene soporte: migra sus sitios (Stack Web → 17)."
+        ((failed++)) || true ;;
+    esac
+  done
+
+  echo
+  if (( failed == 0 )); then
+    msg_ok "PHP actualizado y parcheado en todas las ramas seleccionadas."
+  else
+    msg_warn "${failed} rama(s) siguen requiriendo acción (ver arriba)."
+    return 1
+  fi
+}
+
+# Elige rama destino segura distinta de $1. Resultado en REPLY_PHP_BRANCH.
+php_choose_target_branch() {
+  local exclude="$1" opts=() i=1 opt ver tag
+  for ver in "${PHP_SUPPORTED_VERSIONS[@]}"; do
+    [[ "$ver" == "$exclude" ]] && continue
+    opts+=("$ver")
+    tag=""
+    [[ "$ver" == "$PHP_RECOMMENDED_VERSION" ]] && tag=" ${GREEN}(recomendada)${RESET}"
+    dpkg -s "php${ver}-fpm" >/dev/null 2>&1 && tag+=" ${CYAN}[instalada]${RESET}"
+    printf '  %d) PHP %s  (soporte hasta %s)%b\n' "$i" "$ver" "${PHP_EOL_DATE[$ver]}" "$tag"
+    ((i++))
+  done
+  echo "  0) Cancelar"; echo
+  while true; do
+    read -rp "  Opción: " opt
+    [[ "$opt" == "0" ]] && return 1
+    if [[ "$opt" =~ ^[1-9][0-9]*$ ]] && (( opt <= ${#opts[@]} )); then
+      REPLY_PHP_BRANCH="${opts[$((opt-1))]}"; return 0
+    fi
+    msg_error "Opción inválida."
+  done
+}
+
+# Instala la rama destino replicando las extensiones de la rama origen.
+php_install_branch_like() {
+  local src="$1" dst="$2" pkg suffix pkgs=() skipped=()
+  local base=(fpm cli common mysql curl gd mbstring xml zip
+              bcmath intl soap imagick redis opcache)
+  for suffix in "${base[@]}"; do pkgs+=("php${dst}-${suffix}"); done
+  while IFS= read -r pkg; do
+    suffix="${pkg#php"${src}"-}"
+    [[ " ${pkgs[*]} " == *" php${dst}-${suffix} "* ]] && continue
+    if apt-cache show "php${dst}-${suffix}" >/dev/null 2>&1; then
+      pkgs+=("php${dst}-${suffix}")
+    else
+      skipped+=("$suffix")
+    fi
+  done < <(php_branch_installed_pkgs "$src")
+
+  msg_info "Instalando PHP ${dst} con ${#pkgs[@]} paquete(s)..."
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" || return 1
+  [[ -n "${skipped[0]:-}" ]] \
+    && msg_warn "Sin equivalente en PHP ${dst} (revisa si tu app los necesita): ${skipped[*]}"
+  systemctl enable --now "php${dst}-fpm" || return 1
+}
+
+php_migrate_sites() {
+  msg_section "Migrar sitios a otra rama PHP"
+  msg_info "El socket de cada sitio no cambia, así que Nginx no se modifica."
+  echo
+  msg_info "Rama ORIGEN (de donde salen los sitios):"
+  php_choose_installed_branch "n" || { msg_warn "Operación cancelada."; return 0; }
+  local src="$REPLY_PHP_BRANCH"
+
+  local sites=()
+  mapfile -t sites < <(php_branch_sites "$src")
+  if [[ -z "${sites[0]:-}" ]]; then
+    msg_warn "PHP ${src} no tiene pools ${DEVLAB_POOL_PREFIX}* (sitios aislados)."
+    msg_info "Si hay sitios sin aislar, migra primero su aislamiento: Stack Web → 8."
+    return 0
+  fi
+
+  echo; msg_info "Rama DESTINO:"
+  php_choose_target_branch "$src" || { msg_warn "Operación cancelada."; return 0; }
+  local dst="$REPLY_PHP_BRANCH"
+
+  echo; msg_info "Sitios en PHP ${src}:"
+  local i=1 s
+  for s in "${sites[@]}"; do printf '  %d) %s\n' "$i" "$s"; ((i++)); done
+  echo "  a) Todos"; echo "  0) Cancelar"; echo
+  local opt selected=()
+  while true; do
+    read -rp "  Opción: " opt
+    [[ "$opt" == "0" ]] && { msg_warn "Operación cancelada."; return 0; }
+    if [[ "${opt,,}" == "a" ]]; then selected=("${sites[@]}"); break; fi
+    if [[ "$opt" =~ ^[1-9][0-9]*$ ]] && (( opt <= ${#sites[@]} )); then
+      selected=("${sites[$((opt-1))]}"); break
+    fi
+    msg_error "Opción inválida."
+  done
+
+  echo
+  msg_warn "Se migrarán ${#selected[@]} sitio(s) de PHP ${src} → ${dst}."
+  msg_warn "Prueba antes la app en ${dst} (cambios de compatibilidad entre versiones)."
+  prompt_yes_no "¿Continuar?" "n"
+  [[ "$REPLY_YESNO" == "s" ]] || { msg_warn "Operación cancelada."; return 0; }
+
+  if ! dpkg -s "php${dst}-fpm" >/dev/null 2>&1; then
+    detect_debian_codename
+    apt-get update || return 1
+    php_install_branch_like "$src" "$dst" || { msg_error "No se pudo instalar PHP ${dst}."; return 1; }
+  fi
+  local dst_up
+  dst_up="$(php_installed_pkg_version "$dst" || true)"
+  if [[ "$(php_branch_status "$dst" "$dst_up")" != "safe" ]]; then
+    msg_error "PHP ${dst} instalado (${dst_up:-?}) no alcanza el mínimo seguro ${PHP_MIN_SAFE[$dst]}."
+    msg_info "Ejecuta primero Stack Web → 16 y vuelve a intentarlo."
+    return 1
+  fi
+
+  local site src_pool dst_pool sock migrated=0 failed=0
+  for site in "${selected[@]}"; do
+    src_pool="/etc/php/${src}/fpm/pool.d/${DEVLAB_POOL_PREFIX}${site}.conf"
+    dst_pool="/etc/php/${dst}/fpm/pool.d/${DEVLAB_POOL_PREFIX}${site}.conf"
+    sock="/run/php/${DEVLAB_POOL_PREFIX}${site}.sock"
+    echo; echo -e "  ${BOLD}── ${site} ──${RESET}"
+
+    install -o root -g root -m 0644 "$src_pool" "$dst_pool" || { ((failed++)) || true; continue; }
+    if ! "php-fpm${dst}" -t >/dev/null 2>&1; then
+      rm -f "$dst_pool"
+      msg_error "El pool no valida en PHP ${dst}; ${site} sigue en ${src}."
+      ((failed++)) || true; continue
+    fi
+
+    # Liberar el socket en origen y levantarlo en destino.
+    mv "$src_pool" "${src_pool}.migrated"
+    systemctl reload "php${src}-fpm" 2>/dev/null || systemctl restart "php${src}-fpm" || true
+    # Un socket huérfano daría un falso positivo en la comprobación posterior.
+    rm -f "$sock"
+    systemctl reload "php${dst}-fpm" 2>/dev/null || systemctl restart "php${dst}-fpm" || true
+    sleep 1
+
+    if [[ -S "$sock" ]] && systemctl is-active --quiet "php${dst}-fpm"; then
+      rm -f "${src_pool}.migrated"
+      msg_ok "${site}: ahora en PHP ${dst}."
+      ((migrated++)) || true
+    else
+      msg_error "${site}: el socket no apareció en PHP ${dst}; revirtiendo..."
+      rm -f "$dst_pool"
+      mv "${src_pool}.migrated" "$src_pool"
+      systemctl reload "php${dst}-fpm" 2>/dev/null || systemctl restart "php${dst}-fpm" || true
+      systemctl reload "php${src}-fpm" 2>/dev/null || systemctl restart "php${src}-fpm" || true
+      ((failed++)) || true
+    fi
+  done
+
+  echo
+  msg_info "Migrados: ${migrated} · Fallidos: ${failed}"
+  if (( migrated > 0 )); then
+    PHP_VERSION="$dst"
+    msg_ok "Versión activa en el script: PHP ${PHP_VERSION}"
+    msg_info "Revisa en ${dst}: duración de sesión (Stack Web → 11) y límites de subida (→ 10)."
+  fi
+
+  if [[ -z "$(php_branch_sites "$src")" ]] && (( failed == 0 )); then
+    echo
+    msg_info "PHP ${src} ya no sirve ningún sitio aislado."
+    prompt_yes_no "¿Detener y deshabilitar php${src}-fpm? (los paquetes se conservan)" "s"
+    if [[ "$REPLY_YESNO" == "s" ]]; then
+      systemctl disable --now "php${src}-fpm" \
+        && msg_ok "php${src}-fpm detenido. Para eliminarlo: apt-get purge 'php${src}-*'"
+    fi
+  fi
+  (( failed == 0 ))
+}
+
+readonly PHP_MITIGATION_INI="99-devlab-cve-mitigation.ini"
+
+php_mitigation() {
+  msg_section "Mitigación temporal (${PHP_SECURITY_REF})"
+  msg_warn "NO sustituye a actualizar. Reduce exposición mientras llega el parche."
+  echo "  Aplica en FPM: session.upload_progress.enabled = 0"
+  echo "                 fatal_error_backtraces = 0 (solo PHP 8.5+)"
+  echo
+  echo "  1) Aplicar en todas las ramas instaladas"
+  echo "  2) Retirar la mitigación"
+  echo "  0) Cancelar"; echo
+  local opt
+  while true; do
+    read -rp "  Opción: " opt
+    case "$opt" in 0|1|2) break ;; *) msg_error "Opción inválida." ;; esac
+  done
+  [[ "$opt" == "0" ]] && return 0
+
+  local installed=() ver ini failed=0
+  mapfile -t installed < <(detect_installed_php_versions)
+  for ver in "${installed[@]}"; do
+    [[ -d "/etc/php/${ver}/fpm/conf.d" ]] || continue
+    ini="/etc/php/${ver}/fpm/conf.d/${PHP_MITIGATION_INI}"
+    if [[ "$opt" == "1" ]]; then
+      {
+        echo "; DevLab Manager — mitigación temporal ${PHP_SECURITY_REF}"
+        echo "; Retirar tras actualizar PHP (Stack Web → 18 → 2)."
+        echo "session.upload_progress.enabled = 0"
+        dpkg --compare-versions "$ver" ge 8.5 && echo "fatal_error_backtraces = 0"
+      } > "$ini"
+      chmod 0644 "$ini"
+    else
+      [[ -f "$ini" ]] || continue
+      rm -f "$ini"
+    fi
+    if php_restart_branch "$ver"; then
+      if [[ "$opt" == "1" ]]; then
+        msg_ok "Mitigación activa en PHP ${ver}."
+      else
+        msg_ok "Mitigación retirada en PHP ${ver}."
+      fi
+    else
+      if [[ "$opt" == "1" ]]; then
+        rm -f "$ini"
+        systemctl restart "php${ver}-fpm" 2>/dev/null || true
+      fi
+      ((failed++)) || true
+    fi
+  done
+  (( failed == 0 ))
 }
 
 install_catch_all() {
@@ -410,6 +878,8 @@ install_base_stack() {
   local selected_php="${2:-}"
   detect_debian_codename
   if [[ -n "$selected_php" ]]; then
+    php_branch_supported "$selected_php" \
+      || { msg_error "PHP ${selected_php} no tiene soporte de seguridad."; return 1; }
     PHP_VERSION="$selected_php"
     msg_info "Versión PHP seleccionada previamente: ${PHP_VERSION}"
   else
@@ -459,6 +929,15 @@ https://packages.sury.org/php/ ${DEBIAN_CODENAME} main" \
   for m in "${php_modules[@]}"; do php_pkgs+=("php${PHP_VERSION}-${m}"); done
   apt-get install -y "${php_pkgs[@]}" || return 1
   systemctl enable --now "php${PHP_VERSION}-fpm" || return 1
+  local php_up php_st
+  php_up="$(php_installed_pkg_version "$PHP_VERSION" || true)"
+  php_st="$(php_branch_status "$PHP_VERSION" "$php_up")"
+  if [[ "$php_st" == "safe" ]]; then
+    msg_ok "PHP ${php_up} cumple el mínimo seguro (${PHP_MIN_SAFE[$PHP_VERSION]})."
+  else
+    msg_error "PHP ${php_up:-?} instalado NO cumple el mínimo seguro ${PHP_MIN_SAFE[$PHP_VERSION]:-}."
+    msg_warn "El repositorio aún no publica el parche: aplica Stack Web → 18 y luego → 16."
+  fi
 
   msg_info "[6/6] Instalando catch-all bloqueador..."
   install_catch_all || return 1
@@ -4710,6 +5189,22 @@ sec_audit() {
       || _chk "Directorio de backups SQL" warn "${backup_dir} (${backup_mode}; esperado 700)"
   fi
 
+  echo; echo -e "  ${BOLD}── PHP ──${RESET}"
+  local php_ver php_up php_st php_any=0
+  while IFS= read -r php_ver; do
+    [[ -n "$php_ver" ]] || continue
+    php_any=1
+    php_up="$(php_installed_pkg_version "$php_ver" || true)"
+    php_st="$(php_branch_status "$php_ver" "$php_up")"
+    case "$php_st" in
+      safe)       _chk "PHP ${php_ver}" ok "${php_up} (≥ ${PHP_MIN_SAFE[$php_ver]})" ;;
+      vulnerable) _chk "PHP ${php_ver}" warn "${php_up:-?} vulnerable; mínimo ${PHP_MIN_SAFE[$php_ver]} (Stack Web → 16)" ;;
+      eol)        _chk "PHP ${php_ver}" warn "${php_up:-?} sin soporte; migra sitios (Stack Web → 17)" ;;
+      *)          _chk "PHP ${php_ver}" warn "versión no determinada (Stack Web → 15)" ;;
+    esac
+  done < <(detect_installed_php_versions)
+  (( php_any == 1 )) || _chk "PHP" ok "no instalado"
+
   echo; echo -e "  ${BOLD}── Sistema ──${RESET}"
   dpkg -s unattended-upgrades >/dev/null 2>&1 \
     && _chk "Actualizaciones automáticas" ok "habilitadas" \
@@ -5934,6 +6429,11 @@ menu_web_stack() {
     echo -e "  ${CYAN}11)${RESET} Configurar duración de sesión PHP"
     echo -e "  ${CYAN}12)${RESET} Estado y versiones PHP"
     echo -e "  ${CYAN}13)${RESET} Cambiar versión PHP activa"
+    menu_cat "Seguridad PHP" "$CYAN"
+    echo -e "  ${CYAN}15)${RESET} Auditoría de seguridad PHP  (parches y soporte por rama)"
+    echo -e "  ${CYAN}16)${RESET} Actualizar PHP instalado a la última versión parcheada"
+    echo -e "  ${CYAN}17)${RESET} Migrar sitios a otra rama PHP  (p. ej. 8.1 → 8.4)"
+    echo -e "  ${CYAN}18)${RESET} Mitigación temporal del último CVE  (aplicar/retirar)"
     menu_cat "Zona de peligro" "$RED"
     echo -e "  ${RED}14)${RESET} Eliminar TODO el Stack Web (limpiar la máquina)"
     echo
@@ -5955,6 +6455,10 @@ menu_web_stack() {
       12) run_item header_web_stack show_php_status ;;
       13) run_item header_web_stack select_php_version switch ;;
       14) run_item header_web_stack uninstall_web_stack ;;
+      15) run_item header_web_stack php_security_audit ;;
+      16) run_item header_web_stack php_update_installed ;;
+      17) run_item header_web_stack php_migrate_sites ;;
+      18) run_item header_web_stack php_mitigation ;;
       0)  return ;;
       *)  msg_error "Opción inválida."; pause ;;
     esac
@@ -6458,6 +6962,7 @@ main_menu() {
     else
       echo -e "  ${YELLOW}Aislamiento de sitios: ${iso_summary} — migra desde Stack Web → 8${RESET}"
     fi
+    php_security_banner || true
     echo
 
     local ip_local ip_publica="oculta"
