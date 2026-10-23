@@ -5,13 +5,14 @@ Gestor Bash interactivo para preparar y operar VPS/LXC de producción con **Ngin
 Está orientado a múltiples aplicaciones PHP, HTML o JavaScript en un mismo servidor. Incluye creación de virtual hosts, despliegues desde GitHub, backups SQL, hardening SSH, firewall, monitoreo y auditoría básica.
 
 **Autor:** Marcos Espinoza Torres
-**Versión:** 2.4
+**Versión:** 2.6
 
 > Este script modifica servicios del sistema. Pruébalo primero en una VPS desechable o snapshot y mantén abierta una segunda sesión SSH durante cambios de firewall, puerto o autenticación.
 
 ## Compatibilidad y requisitos
 
 - Debian 12 o Debian 13; otras distribuciones no están soportadas.
+- Bash 4 o superior (Debian incluye una versión compatible).
 - Ejecución como `root` o mediante `sudo`.
 - Terminal interactiva (TTY).
 - Acceso a Internet para APT, Sury, GitHub y Cloudflare.
@@ -46,7 +47,7 @@ Desde el menú principal, **A) Puesta en marcha** ofrece dos perfiles:
 
 El asistente muestra el plan completo antes de modificar el servidor. Las decisiones críticas de SSH, firewall y autenticación externa conservan sus confirmaciones propias para prevenir pérdida de acceso.
 
-1. **Stack Web:** Nginx, PHP-FPM 8.1–8.4, extensiones, virtual hosts, límites PHP y catch-all.
+1. **Stack Web:** Nginx, PHP-FPM 8.2–8.5, extensiones, virtual hosts, aislamiento por sitio, actualización y migración segura entre ramas.
 2. **MySQL / MariaDB:** instalación, bases, usuarios, grants, diagnóstico, backups y restauración.
 3. **Cloudflare Tunnel:** instalación, autenticación, túneles, `config.yml`, estado y logs.
 4. **Git / Deploy:** clave SSH, clone seguro, pull fast-forward y acciones post-deploy.
@@ -66,6 +67,32 @@ El asistente muestra el plan completo antes de modificar el servidor. Las decisi
 6. Verificar el túnel, `config.yml` y las rutas DNS de Cloudflare.
 7. Ejecutar la auditoría y resolver cualquier etapa que el asistente haya marcado con error.
 8. Probar SSH desde otra sesión antes de cerrar la conexión administrativa.
+
+## Seguridad y ciclo de vida de PHP
+
+DevLab Manager solo ofrece para instalaciones nuevas ramas PHP con soporte de seguridad. PHP 8.1 y cualquier rama desconocida se consideran fuera de soporte: pueden detectarse y migrarse, pero no seleccionarse como destino nuevo.
+
+La política incluida en la versión 2.6 responde al boletín crítico publicado por PHP el 21 de octubre de 2026 para `CVE-2026-109618` y `CVE-2026-109619`. Estas son las versiones mínimas aceptadas:
+
+| Rama | Versión mínima segura | Soporte de seguridad hasta |
+|---|---:|---:|
+| PHP 8.2 | 8.2.35 | 31-12-2026 |
+| PHP 8.3 | 8.3.36 | 31-12-2027 |
+| PHP 8.4 | 8.4.27 | 31-12-2028 |
+| PHP 8.5 | 8.5.12 | 31-12-2029 |
+
+PHP 8.4 es la rama recomendada de forma predeterminada. Las referencias de la política son el [boletín oficial de seguridad de PHP](https://www.php.net/archive/2026.php#2026-10-21-5) y la [tabla oficial de versiones soportadas](https://www.php.net/supported-versions.php).
+
+El submenú **Stack Web → Seguridad PHP** incluye:
+
+- **15 — Auditoría:** compara cada versión instalada con el mínimo seguro, muestra la candidata disponible en APT y enumera los sitios asociados a cada rama.
+- **16 — Actualizar:** actualiza todos los paquetes instalados de una rama, conserva configuraciones locales, valida `php-fpm` y comprueba que el servicio quede activo.
+- **17 — Migrar sitios:** replica extensiones, mueve pools PHP de forma individual y revierte el sitio si el socket no aparece en la rama destino.
+- **18 — Mitigación temporal:** deshabilita `session.upload_progress` y, cuando corresponde, `fatal_error_backtraces`; también permite retirar estos cambios.
+
+> La mitigación temporal no corrige completamente estas vulnerabilidades. PHP indica que actualizar es la única solución segura. Debe utilizarse únicamente mientras el repositorio APT publica el parche y retirarse después de actualizar.
+
+El menú principal muestra una alerta cuando detecta una rama vulnerable o sin soporte. La auditoría general de seguridad también incluye el estado de cada PHP instalado. Las versiones candidatas se obtienen desde la caché APT local; ejecuta la opción 16 para actualizar los índices antes de evaluar la disponibilidad definitiva del parche.
 
 ## Modelo de seguridad de los sitios
 
@@ -176,9 +203,10 @@ sudo fail2ban-client -t
 sudo fail2ban-client status
 curl -I https://tu-dominio.cl
 curl -I https://tu-dominio.cl/.env    # debe responder 403 o 404
+apt-cache policy php8.4-fpm
 ```
 
-También ejecuta **Seguridad → Auditoría de seguridad** y revisa manualmente los logs del primer despliegue.
+También ejecuta **Stack Web → 15 (Auditoría de seguridad PHP)** y **Seguridad → Auditoría de seguridad**, y revisa manualmente los logs del primer despliegue.
 
 ## Alcance y limitaciones
 
@@ -186,6 +214,8 @@ También ejecuta **Seguridad → Auditoría de seguridad** y revisa manualmente 
 - No configura TLS directo en Nginx; el diseño principal usa Cloudflare Tunnel. Si expones Nginx, configura certificados y HTTPS explícitamente.
 - No rota secretos ni cifra `.env` en reposo.
 - No verifica todavía checksum de todos los binarios externos descargados, especialmente `cloudflared`.
+- La tabla de versiones mínimas PHP está integrada en el script y debe actualizarse ante nuevos boletines oficiales.
+- La disponibilidad del parche depende de que el repositorio Sury lo haya publicado para la versión de Debian utilizada.
 - Los headers de seguridad genéricos pueden requerir ajustes por aplicación.
 - Antes de usar “Zona de peligro”, confirma backups recuperables.
 
