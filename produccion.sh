@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  DevLab Manager v2.6 - Marcos Espinoza Torres
+#  DevLab Manager v2.7 - Marcos Espinoza Torres
 #  Stack completo: Nginx · PHP-FPM · MySQL/MariaDB · Cloudflared | Debian 12/13
 # ==============================================================================
 set -euo pipefail
@@ -9,7 +9,7 @@ set -euo pipefail
 # que necesitan lectura de Nginx/PHP abren permisos de forma explícita después.
 umask 077
 
-readonly SCRIPT_VERSION="2.6 - Marcos Espinoza Torres"
+readonly SCRIPT_VERSION="2.7 - Marcos Espinoza Torres"
 readonly CATCH_ALL_FILE="/etc/nginx/sites-available/000-catch-all"
 readonly MARIADB_CNF="/etc/mysql/mariadb.conf.d/50-server.cnf"
 readonly MYSQL_CNF="/etc/mysql/mysql.conf.d/mysqld.cnf"
@@ -20,11 +20,14 @@ readonly SESSION_OPTIONS=(2 4 8 16 24)
 # Política de versiones PHP (fuente: php.net/supported-versions.php y boletines).
 # Solo se ofrecen ramas con soporte de seguridad; PHP_MIN_SAFE es la primera
 # versión que corrige el último boletín crítico. Actualizar ante cada boletín.
-readonly PHP_SECURITY_REF="CVE-2026-109618 / CVE-2026-109619 (php.net, 21-oct-2026)"
+readonly PHP_SECURITY_REF="versiones de seguridad PHP publicadas el 19-nov-2026"
+readonly PHP_MITIGATION_REF="CVE-2026-109618 / CVE-2026-109619 (php.net, 21-oct-2026)"
 readonly PHP_SUPPORTED_VERSIONS=(8.2 8.3 8.4 8.5)
 readonly PHP_RECOMMENDED_VERSION="8.4"
-declare -rA PHP_MIN_SAFE=([8.2]=8.2.35 [8.3]=8.3.36 [8.4]=8.4.27 [8.5]=8.5.12)
+declare -rA PHP_MIN_SAFE=([8.2]=8.2.36 [8.3]=8.3.37 [8.4]=8.4.28 [8.5]=8.5.13)
 declare -rA PHP_EOL_DATE=([8.2]=2026-12-31 [8.3]=2027-12-31 [8.4]=2028-12-31 [8.5]=2029-12-31)
+readonly NGINX_SECURITY_REF="nginx 1.30.7 estable / 1.31.9 mainline (nginx.org, 18-nov-2026)"
+readonly NGINX_BACKUP_DIR="/var/backups/devlab/nginx"
 readonly CLOUDFLARED_CONFIG="/etc/cloudflared/config.yml"
 readonly CLOUDFLARED_DIR="/etc/cloudflared"
 readonly GIT_DEPLOY_KEY="/root/.ssh/deploy_ed25519"
@@ -400,7 +403,7 @@ show_php_status() {
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Versión upstream (X.Y.Z) a partir de una versión Debian/Sury:
-# "2:8.4.27-1+0~20261021.1+debian12~1.gbp1" → "8.4.27"
+# "2:8.4.28-1+0~20261119.1+debian12~1.gbp1" → "8.4.28"
 php_upstream_version() {
   local v="${1#*:}"
   v="${v%%[-+~]*}"
@@ -419,11 +422,32 @@ php_installed_pkg_version() {
   return 1
 }
 
+php_installed_pkg_raw() {
+  local ver="$1"
+  dpkg-query -W -f='${db:Status-Abbrev} ${Version}' "php${ver}-fpm" 2>/dev/null \
+    | awk '$1 ~ /^ii/ {print $2; exit}'
+}
+
+php_candidate_pkg_raw() {
+  local ver="$1" cand
+  cand="$(apt-cache policy "php${ver}-fpm" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+  [[ -n "$cand" && "$cand" != "(none)" ]] || return 1
+  printf '%s\n' "$cand"
+}
+
 php_candidate_pkg_version() {
   local ver="$1" cand
   cand="$(apt-cache policy "php${ver}-fpm" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
   [[ -n "$cand" && "$cand" != "(none)" ]] || return 1
   php_upstream_version "$cand"
+}
+
+php_branch_update_available() {
+  local ver="$1" installed candidate
+  installed="$(php_installed_pkg_raw "$ver" || true)"
+  candidate="$(php_candidate_pkg_raw "$ver" || true)"
+  [[ -n "$installed" && -n "$candidate" ]] || return 1
+  dpkg --compare-versions "$candidate" gt "$installed"
 }
 
 php_branch_supported() {
@@ -437,8 +461,14 @@ php_branch_supported() {
 php_branch_status() {
   local ver="$1" upstream="${2:-}"
   local min="${PHP_MIN_SAFE[$ver]:-}" eol="${PHP_EOL_DATE[$ver]:-}"
-  if [[ -z "$min" || -z "$eol" ]] || ! php_branch_supported "$ver"; then
-    echo "eol"; return 0
+  if ! php_branch_supported "$ver" || [[ -z "$min" || -z "$eol" ]]; then
+    if [[ "$ver" =~ ^[0-9]+\.[0-9]+$ ]] \
+       && dpkg --compare-versions "$ver" lt "${PHP_SUPPORTED_VERSIONS[0]}"; then
+      echo "eol"
+    else
+      echo "unknown"
+    fi
+    return 0
   fi
   [[ "$(date +%F)" > "$eol" ]] && { echo "eol"; return 0; }
   [[ -n "$upstream" ]] || { echo "unknown"; return 0; }
@@ -452,6 +482,7 @@ php_branch_status() {
 php_status_label() {
   case "$1" in
     safe)       printf '%s' "${GREEN}✔ seguro${RESET}" ;;
+    outdated)   printf '%s' "${YELLOW}⚠ ACTUALIZACIÓN DISPONIBLE${RESET}" ;;
     vulnerable) printf '%s' "${RED}✖ VULNERABLE${RESET}" ;;
     eol)        printf '%s' "${RED}✖ SIN SOPORTE (EOL)${RESET}" ;;
     *)          printf '%s' "${YELLOW}? desconocido${RESET}" ;;
@@ -469,20 +500,25 @@ php_branch_sites() {
 
 # Resumen rápido para el menú principal (solo dpkg, sin red).
 php_security_banner() {
-  local ver up st bad=()
+  local ver up st bad=() alert_color="$YELLOW"
   while IFS= read -r ver; do
     [[ -n "$ver" ]] || continue
     up="$(php_installed_pkg_version "$ver" || true)"
     st="$(php_branch_status "$ver" "$up")"
+    if [[ "$st" == "safe" ]] && php_branch_update_available "$ver"; then
+      st="outdated"
+    fi
     case "$st" in
-      vulnerable) bad+=("${ver} (${up:-?})") ;;
-      eol)        bad+=("${ver} EOL") ;;
+      vulnerable) bad+=("${ver} (${up:-?})"); alert_color="$RED" ;;
+      eol)        bad+=("${ver} EOL"); alert_color="$RED" ;;
+      outdated)   bad+=("${ver} actualizable") ;;
+      unknown)    bad+=("${ver} sin política validada") ;;
     esac
   done < <(detect_installed_php_versions)
   (( ${#bad[@]} == 0 )) && return 0
   local joined
   joined="$(printf '%s, ' "${bad[@]}")"
-  echo -e "  ${RED}${BOLD}⚠ PHP inseguro: ${joined%, } — Stack Web → 15 (auditar) / 16 (actualizar)${RESET}"
+  echo -e "  ${alert_color}${BOLD}⚠ PHP requiere atención: ${joined%, } — Stack Web → 15 / 16${RESET}"
 }
 
 php_security_audit() {
@@ -505,6 +541,9 @@ php_security_audit() {
     cand="$(php_candidate_pkg_version "$ver" || true)"
     min="${PHP_MIN_SAFE[$ver]:-—}"
     st="$(php_branch_status "$ver" "$up")"
+    if [[ "$st" == "safe" ]] && php_branch_update_available "$ver"; then
+      st="outdated"
+    fi
     sites="$(php_branch_sites "$ver" | paste -sd, -)"
     printf '  %-6s %-12s %-12s %-12s %-35b %s\n' \
       "$ver" "${up:-?}" "${cand:-—}" "$min" "$(php_status_label "$st")" "${sites:-—}"
@@ -523,10 +562,12 @@ php_security_audit() {
   fi
   msg_warn "${issues} rama(s) requieren acción:"
   echo "    • Vulnerable con parche disponible → Stack Web → 16 (Actualizar PHP instalado)"
+  echo "    • Actualización disponible         → Stack Web → 16 (incluye revisiones Debian/Sury)"
   echo "    • Rama EOL (p. ej. 8.1)            → Stack Web → 17 (Migrar sitios a otra rama)"
+  echo "    • Rama desconocida/nueva           → actualizar paquetes y validar compatibilidad manualmente"
   if (( pending_repo > 0 )); then
     msg_warn "El repositorio aún no ofrece la versión parcheada para ${pending_repo} rama(s)."
-    echo "    • Aplica la mitigación temporal (Stack Web → 18) y reintenta más tarde."
+    echo "    • No se asume una mitigación genérica: limita exposición y reintenta la actualización."
   fi
   msg_info "'EN APT' se consulta con la caché local; la opción 16 ejecuta apt-get update antes."
   return 1
@@ -584,24 +625,37 @@ php_restart_branch() {
 }
 
 php_update_installed() {
+  local requested="${1:-interactive}" preconfirmed="${2:-n}" skip_apt_update="${3:-n}"
   msg_section "Actualizar PHP instalado a la última versión parcheada"
-  msg_info "Selecciona la rama a actualizar:"
-  echo
-  php_choose_installed_branch "s" || { msg_warn "Operación cancelada."; return 0; }
-
   local branches=() ver
-  if [[ "$REPLY_PHP_BRANCH" == "all" ]]; then
+  if [[ "$requested" == "all" ]]; then
     mapfile -t branches < <(detect_installed_php_versions)
   else
-    branches=("$REPLY_PHP_BRANCH")
+    msg_info "Selecciona la rama a actualizar:"
+    echo
+    php_choose_installed_branch "s" || { msg_warn "Operación cancelada."; return 0; }
+    if [[ "$REPLY_PHP_BRANCH" == "all" ]]; then
+      mapfile -t branches < <(detect_installed_php_versions)
+    else
+      branches=("$REPLY_PHP_BRANCH")
+    fi
   fi
 
-  msg_warn "Se reiniciará PHP-FPM de cada rama actualizada (corte de pocos segundos)."
-  prompt_yes_no "¿Continuar?" "s"
-  [[ "$REPLY_YESNO" == "s" ]] || { msg_warn "Operación cancelada."; return 0; }
+  if [[ -z "${branches[0]:-}" ]]; then
+    msg_warn "No hay ramas PHP instaladas; se omite."
+    return 0
+  fi
 
-  msg_info "Actualizando índices de paquetes..."
-  apt-get update || { msg_error "apt-get update falló."; return 1; }
+  if [[ "$preconfirmed" != "s" ]]; then
+    msg_warn "Se reiniciará PHP-FPM de cada rama actualizada (corte de pocos segundos)."
+    prompt_yes_no "¿Continuar?" "s"
+    [[ "$REPLY_YESNO" == "s" ]] || { msg_warn "Operación cancelada."; return 0; }
+  fi
+
+  if [[ "$skip_apt_update" != "s" ]]; then
+    msg_info "Actualizando índices de paquetes..."
+    apt-get update || { msg_error "apt-get update falló."; return 1; }
+  fi
 
   local failed=0 before after st pkgs=()
   for ver in "${branches[@]}"; do
@@ -624,17 +678,21 @@ php_update_installed() {
     case "$st" in
       vulnerable)
         msg_warn "El repositorio aún no publica ${PHP_MIN_SAFE[$ver]:-la versión parcheada} para ${ver}."
-        msg_info "Aplica la mitigación temporal (Stack Web → 18) y reintenta más tarde."
+        msg_info "No se considera seguro: limita su exposición y reintenta la actualización más tarde."
         ((failed++)) || true ;;
       eol)
         msg_warn "PHP ${ver} no tiene soporte: migra sus sitios (Stack Web → 17)."
+        ((failed++)) || true ;;
+      unknown)
+        msg_warn "PHP ${ver} se actualizó, pero aún no está incorporado a la política validada del script."
+        msg_info "Comprueba su soporte, extensiones y compatibilidad antes de usarlo en producción."
         ((failed++)) || true ;;
     esac
   done
 
   echo
   if (( failed == 0 )); then
-    msg_ok "PHP actualizado y parcheado en todas las ramas seleccionadas."
+    msg_ok "PHP actualizado según los repositorios APT y la política de seguridad local."
   else
     msg_warn "${failed} rama(s) siguen requiriendo acción (ver arriba)."
     return 1
@@ -800,8 +858,9 @@ php_migrate_sites() {
 readonly PHP_MITIGATION_INI="99-devlab-cve-mitigation.ini"
 
 php_mitigation() {
-  msg_section "Mitigación temporal (${PHP_SECURITY_REF})"
-  msg_warn "NO sustituye a actualizar. Reduce exposición mientras llega el parche."
+  msg_section "Mitigación temporal (${PHP_MITIGATION_REF})"
+  msg_warn "Esta mitigación corresponde al boletín de octubre; NO cubre vulnerabilidades posteriores."
+  msg_warn "No sustituye a actualizar PHP desde la opción 16."
   echo "  Aplica en FPM: session.upload_progress.enabled = 0"
   echo "                 fatal_error_backtraces = 0 (solo PHP 8.5+)"
   echo
@@ -822,7 +881,7 @@ php_mitigation() {
     ini="/etc/php/${ver}/fpm/conf.d/${PHP_MITIGATION_INI}"
     if [[ "$opt" == "1" ]]; then
       {
-        echo "; DevLab Manager — mitigación temporal ${PHP_SECURITY_REF}"
+        echo "; DevLab Manager — mitigación temporal ${PHP_MITIGATION_REF}"
         echo "; Retirar tras actualizar PHP (Stack Web → 18 → 2)."
         echo "session.upload_progress.enabled = 0"
         dpkg --compare-versions "$ver" ge 8.5 && echo "fatal_error_backtraces = 0"
@@ -847,6 +906,309 @@ php_mitigation() {
     fi
   done
   (( failed == 0 ))
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEGURIDAD Y ACTUALIZACIÓN DE NGINX
+# Se respeta el origen APT configurado: Debian puede backportar correcciones sin
+# adoptar el número de versión upstream. La señal operativa es paquete candidato
+# > paquete instalado; la versión oficial solo se muestra como referencia.
+# ══════════════════════════════════════════════════════════════════════════════
+
+nginx_runtime_version() {
+  nginx -v 2>&1 | sed -nE 's#^nginx version: nginx/([^ ]+).*#\1#p'
+}
+
+nginx_installed_packages() {
+  dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'nginx*' 'libnginx-mod-*' 2>/dev/null \
+    | awk '$1 ~ /^ii/ && ($2 == "nginx" || $2 ~ /^nginx-/ || $2 ~ /^libnginx-mod-/) {print $2}' \
+    | sort -u
+}
+
+apt_installed_version() {
+  dpkg-query -W -f='${db:Status-Abbrev} ${Version}' "$1" 2>/dev/null \
+    | awk '$1 ~ /^ii/ {print $2; exit}'
+}
+
+apt_candidate_version() {
+  local candidate
+  candidate="$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+  [[ -n "$candidate" && "$candidate" != "(none)" ]] || return 1
+  printf '%s\n' "$candidate"
+}
+
+nginx_pending_packages() {
+  local pkg installed candidate
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] || continue
+    installed="$(apt_installed_version "$pkg" || true)"
+    candidate="$(apt_candidate_version "$pkg" || true)"
+    [[ -n "$installed" && -n "$candidate" ]] || continue
+    if dpkg --compare-versions "$candidate" gt "$installed"; then
+      printf '%s\t%s\t%s\n' "$pkg" "$installed" "$candidate"
+    fi
+  done < <(nginx_installed_packages)
+}
+
+nginx_security_banner() {
+  command -v nginx >/dev/null 2>&1 || return 0
+  local pending installed=()
+  mapfile -t installed < <(nginx_installed_packages)
+  if [[ -z "${installed[0]:-}" ]]; then
+    echo -e "  ${RED}${BOLD}⚠ Nginx no está administrado por APT/dpkg — requiere revisión manual${RESET}"
+    return 0
+  fi
+  pending="$(nginx_pending_packages | wc -l | tr -d ' ')"
+  (( ${pending:-0} > 0 )) || return 0
+  echo -e "  ${YELLOW}${BOLD}⚠ Nginx tiene ${pending} paquete(s) actualizable(s) — Stack Web → 19 / 20${RESET}"
+}
+
+nginx_security_audit() {
+  msg_section "Auditoría de seguridad Nginx"
+  if ! command -v nginx >/dev/null 2>&1; then
+    msg_warn "Nginx no está instalado."
+    return 0
+  fi
+
+  local runtime pkg_raw candidate pending=() installed=()
+  runtime="$(nginx_runtime_version || true)"
+  pkg_raw="$(apt_installed_version nginx || true)"
+  candidate="$(apt_candidate_version nginx || true)"
+  mapfile -t installed < <(nginx_installed_packages)
+  mapfile -t pending < <(nginx_pending_packages)
+
+  printf '  %-28s %s\n' "Versión en ejecución:" "${runtime:-desconocida}"
+  printf '  %-28s %s\n' "Paquete nginx instalado:" "${pkg_raw:-desconocido}"
+  printf '  %-28s %s\n' "Candidato APT:" "${candidate:-no disponible}"
+  printf '  %-28s %s\n' "Referencia upstream:" "$NGINX_SECURITY_REF"
+  echo
+  msg_info "Debian puede aplicar parches mediante backports sin igualar la versión upstream."
+
+  local failed=0
+  if [[ -z "${installed[0]:-}" ]]; then
+    msg_error "La instalación en ejecución no está administrada por APT/dpkg."
+    msg_warn "No es posible determinar ni aplicar parches de paquetes de forma segura."
+    failed=1
+  else
+    msg_ok "Paquetes Nginx administrados por APT: ${#installed[@]}."
+  fi
+  if nginx -t >/dev/null 2>&1; then
+    msg_ok "Configuración válida: nginx -t"
+  else
+    msg_error "La configuración actual no supera nginx -t."
+    failed=1
+  fi
+  if systemctl is-active --quiet nginx 2>/dev/null; then
+    msg_ok "Servicio nginx activo."
+  else
+    msg_error "Servicio nginx inactivo."
+    failed=1
+  fi
+
+  echo
+  if [[ -z "${installed[0]:-}" ]]; then
+    msg_warn "La disponibilidad de actualizaciones debe revisarse en el método de instalación original."
+  elif [[ -z "${pending[0]:-}" ]]; then
+    msg_ok "No hay actualizaciones de paquetes Nginx en la caché APT actual."
+    msg_info "Ejecuta la opción 20 para refrescar APT y comprobar nuevamente."
+  else
+    msg_warn "Paquetes Nginx con actualización disponible:"
+    local row p from to
+    for row in "${pending[@]}"; do
+      IFS=$'\t' read -r p from to <<< "$row"
+      printf '    %-28s %s → %s\n' "$p" "$from" "$to"
+    done
+    failed=1
+  fi
+  (( failed == 0 ))
+}
+
+NGINX_LAST_BACKUP=""
+
+nginx_create_config_backup() {
+  [[ -d /etc/nginx ]] || { msg_error "No existe /etc/nginx para respaldar."; return 1; }
+  install -d -o root -g root -m 0700 "$NGINX_BACKUP_DIR" || return 1
+  local stamp tmp final
+  stamp="$(date +%F-%H%M%S)"
+  final="${NGINX_BACKUP_DIR}/nginx-config-${stamp}.tar.gz"
+  tmp="${final}.tmp"
+  if ! tar -C /etc -czf "$tmp" nginx; then
+    rm -f -- "$tmp"
+    msg_error "No se pudo crear el respaldo de /etc/nginx."
+    return 1
+  fi
+  if ! tar -tzf "$tmp" >/dev/null 2>&1; then
+    rm -f -- "$tmp"
+    msg_error "El respaldo de Nginx no superó la verificación de integridad."
+    return 1
+  fi
+  chmod 0600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv "$tmp" "$final" || return 1
+  NGINX_LAST_BACKUP="$final"
+  msg_ok "Respaldo Nginx: ${final}"
+}
+
+nginx_rollback_update() {
+  local backup="$1" manifest="$2" was_active="${3:-s}" pkg version rollback_pkgs=()
+  msg_warn "Intentando rollback de Nginx..."
+
+  while IFS=$'\t' read -r pkg version; do
+    [[ -n "$pkg" && -n "$version" ]] && rollback_pkgs+=("${pkg}=${version}")
+  done < "$manifest"
+
+  local package_ok="s" config_ok="s"
+  if [[ -n "${rollback_pkgs[0]:-}" ]]; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades \
+      -o Dpkg::Options::=--force-confold "${rollback_pkgs[@]}" \
+      || package_ok="n"
+  fi
+  tar -C /etc -xzf "$backup" || config_ok="n"
+
+  if [[ "$package_ok" == "s" && "$config_ok" == "s" ]] \
+     && nginx -t >/dev/null 2>&1; then
+    if [[ "$was_active" == "s" ]]; then
+      if systemctl restart nginx && systemctl is-active --quiet nginx; then
+        msg_ok "Rollback completado; Nginx volvió a la versión y configuración anteriores."
+        return 0
+      fi
+    else
+      systemctl stop nginx >/dev/null 2>&1 || true
+      if ! systemctl is-active --quiet nginx 2>/dev/null; then
+        msg_ok "Rollback completado; Nginx volvió a su configuración y estado inactivo anteriores."
+        return 0
+      fi
+    fi
+  fi
+
+  msg_error "El rollback automático quedó incompleto. No cierres tu sesión administrativa."
+  msg_info "Respaldo disponible: ${backup}"
+  msg_info "Revisa: nginx -t && systemctl status nginx && journalctl -u nginx -n 100"
+  return 1
+}
+
+nginx_update_installed() {
+  local preconfirmed="${1:-n}" skip_apt_update="${2:-n}"
+  msg_section "Actualizar Nginx de forma segura"
+  command -v nginx >/dev/null 2>&1 \
+    || { msg_warn "Nginx no está instalado; se omite."; return 0; }
+
+  local installed=()
+  mapfile -t installed < <(nginx_installed_packages)
+  if [[ -z "${installed[0]:-}" ]]; then
+    msg_error "Nginx no está administrado por APT/dpkg; no se intentará modificarlo."
+    msg_info "Actualízalo mediante el mismo método con que fue instalado y valida con nginx -t."
+    return 1
+  fi
+
+  if ! nginx -t; then
+    msg_error "Corrige la configuración actual antes de actualizar Nginx."
+    return 1
+  fi
+
+  if [[ "$skip_apt_update" != "s" ]]; then
+    msg_info "Actualizando índices APT..."
+    apt-get update || { msg_error "apt-get update falló."; return 1; }
+  fi
+
+  local pending=() row pkg from to packages=()
+  mapfile -t pending < <(nginx_pending_packages)
+  if [[ -z "${pending[0]:-}" ]]; then
+    msg_ok "Nginx ya está actualizado según los repositorios configurados."
+    printf '  %-24s %s\n' "Versión en ejecución:" "$(nginx_runtime_version || echo '?')"
+    return 0
+  fi
+
+  echo "  Se actualizarán:"
+  for row in "${pending[@]}"; do
+    IFS=$'\t' read -r pkg from to <<< "$row"
+    packages+=("$pkg")
+    printf '    %-28s %s → %s\n' "$pkg" "$from" "$to"
+  done
+  echo
+  if ! DEBIAN_FRONTEND=noninteractive apt-get -s install --only-upgrade \
+       -o Dpkg::Options::=--force-confold "${packages[@]}" >/dev/null; then
+    msg_error "APT no pudo resolver de forma simulada la actualización; no se modificó el sistema."
+    return 1
+  fi
+  msg_ok "Simulación APT completada sin conflictos."
+  msg_warn "Nginx se reiniciará; puede existir un corte de pocos segundos."
+  if [[ "$preconfirmed" != "s" ]]; then
+    prompt_yes_no "¿Respaldar, actualizar y validar Nginx ahora?" "s"
+    [[ "$REPLY_YESNO" == "s" ]] || { msg_warn "Operación cancelada."; return 0; }
+  fi
+
+  local manifest before after was_active="n"
+  manifest="$(mktemp)" || return 1
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] || continue
+    printf '%s\t%s\n' "$pkg" "$(apt_installed_version "$pkg")" >> "$manifest"
+  done < <(nginx_installed_packages)
+  if systemctl is-active --quiet nginx 2>/dev/null; then
+    was_active="s"
+  fi
+  before="$(nginx_runtime_version || echo '?')"
+
+  if ! nginx_create_config_backup; then
+    rm -f -- "$manifest"
+    return 1
+  fi
+
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade \
+       -o Dpkg::Options::=--force-confold "${packages[@]}"; then
+    msg_error "APT falló durante la actualización de Nginx."
+    nginx_rollback_update "$NGINX_LAST_BACKUP" "$manifest" "$was_active" || true
+    rm -f -- "$manifest"
+    return 1
+  fi
+
+  if ! nginx -t; then
+    msg_error "La nueva versión no acepta la configuración actual."
+    nginx_rollback_update "$NGINX_LAST_BACKUP" "$manifest" "$was_active" || true
+    rm -f -- "$manifest"
+    return 1
+  fi
+
+  if [[ "$was_active" == "s" ]]; then
+    if ! systemctl restart nginx || ! systemctl is-active --quiet nginx; then
+      msg_error "Nginx no quedó activo después de actualizar."
+      nginx_rollback_update "$NGINX_LAST_BACKUP" "$manifest" "$was_active" || true
+      rm -f -- "$manifest"
+      return 1
+    fi
+  elif systemctl is-active --quiet nginx 2>/dev/null; then
+    systemctl stop nginx || true
+    msg_info "Nginx estaba inactivo antes de actualizar; se conservó ese estado."
+  fi
+
+  after="$(nginx_runtime_version || echo '?')"
+  rm -f -- "$manifest"
+  msg_ok "Nginx actualizado y validado: ${before} → ${after}"
+  msg_ok "Configuración válida y estado del servicio verificado."
+}
+
+web_security_update_all() {
+  msg_section "Actualizar componentes web críticos"
+  echo "  Se actualizarán desde los repositorios configurados:"
+  echo "    1. Nginx y sus módulos instalados"
+  echo "    2. Todas las ramas PHP-FPM instaladas"
+  echo
+  msg_warn "Cuando existan cambios, se respaldará Nginx y se reiniciarán los servicios actualizados."
+  prompt_yes_no "¿Continuar con la actualización web completa?" "s"
+  [[ "$REPLY_YESNO" == "s" ]] || { msg_warn "Operación cancelada."; return 0; }
+
+  apt-get update || { msg_error "apt-get update falló; no se modificó ningún servicio."; return 1; }
+
+  local failed=0
+  nginx_update_installed "s" "s" || { ((failed++)) || true; }
+  php_update_installed "all" "s" "s" || { ((failed++)) || true; }
+
+  echo
+  if (( failed == 0 )); then
+    msg_ok "Nginx y PHP quedaron actualizados según APT."
+  else
+    msg_error "${failed} componente(s) requieren intervención; revisa los mensajes anteriores."
+    return 1
+  fi
 }
 
 install_catch_all() {
@@ -936,7 +1298,10 @@ https://packages.sury.org/php/ ${DEBIAN_CODENAME} main" \
     msg_ok "PHP ${php_up} cumple el mínimo seguro (${PHP_MIN_SAFE[$PHP_VERSION]})."
   else
     msg_error "PHP ${php_up:-?} instalado NO cumple el mínimo seguro ${PHP_MIN_SAFE[$PHP_VERSION]:-}."
-    msg_warn "El repositorio aún no publica el parche: aplica Stack Web → 18 y luego → 16."
+    systemctl disable --now "php${PHP_VERSION}-fpm" >/dev/null 2>&1 || true
+    msg_warn "PHP-FPM fue detenido para no exponer una versión vulnerable."
+    msg_info "Actualiza los índices y ejecuta Stack Web → 16 cuando el repositorio publique el parche."
+    return 1
   fi
 
   msg_info "[6/6] Instalando catch-all bloqueador..."
@@ -3269,14 +3634,62 @@ remove_global_command() {
 sys_update() {
   msg_section "Actualizar sistema"
   msg_info "Actualizando lista de paquetes..."
-  apt-get update
+  apt-get update || { msg_error "apt-get update falló."; return 1; }
   echo
   msg_info "Paquetes con actualización disponible:"
   apt list --upgradable 2>/dev/null | grep -v "^Listing" || true
   echo
+
+  local web_pending="n" ver
+  if [[ -n "$(nginx_pending_packages)" ]]; then
+    web_pending="s"
+  fi
+  while IFS= read -r ver; do
+    [[ -n "$ver" ]] || continue
+    if php_branch_update_available "$ver"; then web_pending="s"; fi
+  done < <(detect_installed_php_versions)
+  if [[ "$web_pending" == "s" ]]; then
+    msg_warn "Se detectaron actualizaciones de Nginx/PHP."
+    msg_info "El flujo especializado agrega backup, validación y rollback antes del upgrade general."
+    prompt_yes_no "¿Actualizar primero los componentes web con el flujo seguro?" "s"
+    if [[ "$REPLY_YESNO" == "s" ]]; then
+      nginx_update_installed "s" "s" || return 1
+      php_update_installed "all" "s" "s" || return 1
+      echo
+    else
+      msg_warn "Actualización general cancelada para no actualizar Nginx/PHP sin sus validaciones específicas."
+      return 0
+    fi
+  fi
+
   prompt_yes_no "¿Aplicar actualizaciones?" "s"
   [[ "$REPLY_YESNO" != "s" ]] && return 0
-  apt-get upgrade -y
+  DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
+    -o Dpkg::Options::=--force-confold || {
+      msg_error "apt-get upgrade terminó con errores."
+      return 1
+    }
+
+  local validation_failed=0
+  if command -v nginx >/dev/null 2>&1 && ! nginx -t; then
+    msg_error "Nginx no supera la validación después de actualizar el sistema."
+    validation_failed=1
+  fi
+  while IFS= read -r ver; do
+    [[ -n "$ver" ]] || continue
+    if ! "php-fpm${ver}" -t >/dev/null 2>&1; then
+      msg_error "PHP-FPM ${ver} no supera su validación después de actualizar."
+      validation_failed=1
+    fi
+  done < <(detect_installed_php_versions)
+
+  [[ -f /var/run/reboot-required ]] \
+    && msg_warn "El sistema requiere reinicio: $(cat /var/run/reboot-required 2>/dev/null || true)"
+  systemctl --failed --no-legend 2>/dev/null | grep -q . \
+    && msg_warn "Hay unidades systemd fallidas; revisa: systemctl --failed" \
+    || msg_ok "No se detectaron unidades systemd fallidas."
+
+  (( validation_failed == 0 )) || return 1
   msg_ok "Sistema actualizado."
 }
 
@@ -5101,6 +5514,23 @@ sec_audit() {
   fi
 
   echo; echo -e "  ${BOLD}── Nginx ──${RESET}"
+  if command -v nginx >/dev/null 2>&1; then
+    local nginx_pending_count nginx_managed=()
+    mapfile -t nginx_managed < <(nginx_installed_packages)
+    nginx_pending_count="$(nginx_pending_packages | wc -l | tr -d ' ')"
+    nginx -t >/dev/null 2>&1 \
+      && _chk "Configuración Nginx" ok "válida; versión $(nginx_runtime_version || echo '?')" \
+      || _chk "Configuración Nginx" warn "nginx -t falla (Stack Web → 19)"
+    if [[ -z "${nginx_managed[0]:-}" ]]; then
+      _chk "Actualizaciones Nginx" warn "binario no administrado por APT/dpkg (Stack Web → 19)"
+    elif [[ "${nginx_pending_count:-0}" -eq 0 ]]; then
+      _chk "Actualizaciones Nginx" ok "sin paquetes pendientes en caché APT"
+    else
+      _chk "Actualizaciones Nginx" warn "${nginx_pending_count} paquete(s) pendiente(s) (Stack Web → 20)"
+    fi
+  else
+    _chk "Nginx" warn "no instalado"
+  fi
   [[ -f "$NGINX_SEC_SNIPPET" ]] \
     && _chk "Headers de seguridad" ok "snippet instalado" \
     || _chk "Headers de seguridad" warn "sin configurar (Seguridad → 10)"
@@ -5196,8 +5626,12 @@ sec_audit() {
     php_any=1
     php_up="$(php_installed_pkg_version "$php_ver" || true)"
     php_st="$(php_branch_status "$php_ver" "$php_up")"
+    if [[ "$php_st" == "safe" ]] && php_branch_update_available "$php_ver"; then
+      php_st="outdated"
+    fi
     case "$php_st" in
       safe)       _chk "PHP ${php_ver}" ok "${php_up} (≥ ${PHP_MIN_SAFE[$php_ver]})" ;;
+      outdated)   _chk "PHP ${php_ver}" warn "${php_up}; actualización APT disponible (Stack Web → 16)" ;;
       vulnerable) _chk "PHP ${php_ver}" warn "${php_up:-?} vulnerable; mínimo ${PHP_MIN_SAFE[$php_ver]} (Stack Web → 16)" ;;
       eol)        _chk "PHP ${php_ver}" warn "${php_up:-?} sin soporte; migra sitios (Stack Web → 17)" ;;
       *)          _chk "PHP ${php_ver}" warn "versión no determinada (Stack Web → 15)" ;;
@@ -6429,11 +6863,14 @@ menu_web_stack() {
     echo -e "  ${CYAN}11)${RESET} Configurar duración de sesión PHP"
     echo -e "  ${CYAN}12)${RESET} Estado y versiones PHP"
     echo -e "  ${CYAN}13)${RESET} Cambiar versión PHP activa"
-    menu_cat "Seguridad PHP" "$CYAN"
+    menu_cat "Seguridad PHP y Nginx" "$CYAN"
     echo -e "  ${CYAN}15)${RESET} Auditoría de seguridad PHP  (parches y soporte por rama)"
     echo -e "  ${CYAN}16)${RESET} Actualizar PHP instalado a la última versión parcheada"
     echo -e "  ${CYAN}17)${RESET} Migrar sitios a otra rama PHP  (p. ej. 8.1 → 8.4)"
-    echo -e "  ${CYAN}18)${RESET} Mitigación temporal del último CVE  (aplicar/retirar)"
+    echo -e "  ${CYAN}18)${RESET} Mitigación temporal CVE octubre 2026  (aplicar/retirar)"
+    echo -e "  ${CYAN}19)${RESET} Auditoría de seguridad Nginx  (configuración + paquetes APT)"
+    echo -e "  ${CYAN}20)${RESET} Actualizar Nginx de forma segura  (backup + rollback)"
+    echo -e "  ${CYAN}21)${RESET} Actualizar componentes web críticos  (Nginx + todas las ramas PHP)"
     menu_cat "Zona de peligro" "$RED"
     echo -e "  ${RED}14)${RESET} Eliminar TODO el Stack Web (limpiar la máquina)"
     echo
@@ -6459,6 +6896,9 @@ menu_web_stack() {
       16) run_item header_web_stack php_update_installed ;;
       17) run_item header_web_stack php_migrate_sites ;;
       18) run_item header_web_stack php_mitigation ;;
+      19) run_item header_web_stack nginx_security_audit ;;
+      20) run_item header_web_stack nginx_update_installed ;;
+      21) run_item header_web_stack web_security_update_all ;;
       0)  return ;;
       *)  msg_error "Opción inválida."; pause ;;
     esac
@@ -6963,6 +7403,7 @@ main_menu() {
       echo -e "  ${YELLOW}Aislamiento de sitios: ${iso_summary} — migra desde Stack Web → 8${RESET}"
     fi
     php_security_banner || true
+    nginx_security_banner || true
     echo
 
     local ip_local ip_publica="oculta"

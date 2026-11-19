@@ -5,7 +5,7 @@ Gestor Bash interactivo para preparar y operar VPS/LXC de producción con **Ngin
 Está orientado a múltiples aplicaciones PHP, HTML o JavaScript en un mismo servidor. Incluye creación de virtual hosts, despliegues desde GitHub, backups SQL, hardening SSH, firewall, monitoreo y auditoría básica.
 
 **Autor:** Marcos Espinoza Torres
-**Versión:** 2.6
+**Versión:** 2.7
 
 > Este script modifica servicios del sistema. Pruébalo primero en una VPS desechable o snapshot y mantén abierta una segunda sesión SSH durante cambios de firewall, puerto o autenticación.
 
@@ -47,7 +47,7 @@ Desde el menú principal, **A) Puesta en marcha** ofrece dos perfiles:
 
 El asistente muestra el plan completo antes de modificar el servidor. Las decisiones críticas de SSH, firewall y autenticación externa conservan sus confirmaciones propias para prevenir pérdida de acceso.
 
-1. **Stack Web:** Nginx, PHP-FPM 8.2–8.5, extensiones, virtual hosts, aislamiento por sitio, actualización y migración segura entre ramas.
+1. **Stack Web:** Nginx, PHP-FPM 8.2–8.5, extensiones, virtual hosts, aislamiento por sitio y actualización segura de ambos servicios.
 2. **MySQL / MariaDB:** instalación, bases, usuarios, grants, diagnóstico, backups y restauración.
 3. **Cloudflare Tunnel:** instalación, autenticación, túneles, `config.yml`, estado y logs.
 4. **Git / Deploy:** clave SSH, clone seguro, pull fast-forward y acciones post-deploy.
@@ -70,29 +70,51 @@ El asistente muestra el plan completo antes de modificar el servidor. Las decisi
 
 ## Seguridad y ciclo de vida de PHP
 
-DevLab Manager solo ofrece para instalaciones nuevas ramas PHP con soporte de seguridad. PHP 8.1 y cualquier rama desconocida se consideran fuera de soporte: pueden detectarse y migrarse, pero no seleccionarse como destino nuevo.
+DevLab Manager solo ofrece para instalaciones nuevas ramas PHP incorporadas a su política de seguridad. PHP 8.1 se considera fuera de soporte; una rama nueva o desconocida queda marcada para validación manual. Ambas pueden detectarse y actualizarse, pero no seleccionarse como destino nuevo.
 
-La política incluida en la versión 2.6 responde al boletín crítico publicado por PHP el 21 de octubre de 2026 para `CVE-2026-109618` y `CVE-2026-109619`. Estas son las versiones mínimas aceptadas:
+La política incluida en la versión 2.7 incorpora las versiones de seguridad que PHP publicó el 19 de noviembre de 2026 para todas sus ramas soportadas. Estas son las versiones mínimas aceptadas:
 
 | Rama | Versión mínima segura | Soporte de seguridad hasta |
 |---|---:|---:|
-| PHP 8.2 | 8.2.35 | 31-12-2026 |
-| PHP 8.3 | 8.3.36 | 31-12-2027 |
-| PHP 8.4 | 8.4.27 | 31-12-2028 |
-| PHP 8.5 | 8.5.12 | 31-12-2029 |
+| PHP 8.2 | 8.2.36 | 31-12-2026 |
+| PHP 8.3 | 8.3.37 | 31-12-2027 |
+| PHP 8.4 | 8.4.28 | 31-12-2028 |
+| PHP 8.5 | 8.5.13 | 31-12-2029 |
 
-PHP 8.4 es la rama recomendada de forma predeterminada. Las referencias de la política son el [boletín oficial de seguridad de PHP](https://www.php.net/archive/2026.php#2026-10-21-5) y la [tabla oficial de versiones soportadas](https://www.php.net/supported-versions.php).
+PHP 8.4 es la rama recomendada de forma predeterminada. Las referencias de la política son el [archivo oficial de versiones de seguridad de PHP](https://www.php.net/archive/2026.php) y la [tabla oficial de versiones soportadas](https://www.php.net/supported-versions.php).
 
-El submenú **Stack Web → Seguridad PHP** incluye:
+El submenú **Stack Web → Seguridad PHP y Nginx** incluye:
 
 - **15 — Auditoría:** compara cada versión instalada con el mínimo seguro, muestra la candidata disponible en APT y enumera los sitios asociados a cada rama.
 - **16 — Actualizar:** actualiza todos los paquetes instalados de una rama, conserva configuraciones locales, valida `php-fpm` y comprueba que el servicio quede activo.
 - **17 — Migrar sitios:** replica extensiones, mueve pools PHP de forma individual y revierte el sitio si el socket no aparece en la rama destino.
-- **18 — Mitigación temporal:** deshabilita `session.upload_progress` y, cuando corresponde, `fatal_error_backtraces`; también permite retirar estos cambios.
+- **18 — Mitigación temporal de octubre de 2026:** deshabilita `session.upload_progress` y, cuando corresponde, `fatal_error_backtraces`; no cubre boletines posteriores y también permite retirar estos cambios.
+- **19 — Auditoría Nginx:** valida la configuración y el servicio, muestra la versión en ejecución y compara todos los paquetes Nginx instalados con sus candidatos APT.
+- **20 — Actualizar Nginx:** refresca APT, respalda `/etc/nginx`, actualiza Nginx y sus módulos, valida la configuración y conserva el estado previo del servicio.
+- **21 — Actualización web completa:** ejecuta en un solo flujo la actualización segura de Nginx y de todas las ramas PHP-FPM instaladas.
 
-> La mitigación temporal no corrige completamente estas vulnerabilidades. PHP indica que actualizar es la única solución segura. Debe utilizarse únicamente mientras el repositorio APT publica el parche y retirarse después de actualizar.
+> La mitigación temporal solo reduce la exposición de `CVE-2026-109618` y `CVE-2026-109619`; no corrige ni mitiga automáticamente las vulnerabilidades críticas publicadas después. Actualizar es la solución segura y la mitigación debe retirarse cuando ya no sea necesaria.
 
-El menú principal muestra una alerta cuando detecta una rama vulnerable o sin soporte. La auditoría general de seguridad también incluye el estado de cada PHP instalado. Las versiones candidatas se obtienen desde la caché APT local; ejecuta la opción 16 para actualizar los índices antes de evaluar la disponibilidad definitiva del parche.
+El menú principal muestra una alerta cuando detecta una rama vulnerable, sin soporte o con un candidato APT más reciente. Esta última comprobación permite detectar nuevas revisiones de seguridad sin esperar a que se actualice la tabla de mínimos integrada. La auditoría general también incluye el estado de PHP y Nginx. Las versiones candidatas se obtienen desde la caché APT local; las opciones 16, 20 y 21 refrescan los índices antes de actualizar.
+
+PHP 8.6 se publicó el 19 de noviembre de 2026, pero todavía no se ofrece como destino automático: una versión mayor requiere validar primero extensiones y compatibilidad de las aplicaciones. El actualizador sí conserva y actualiza las ramas que ya estén instaladas, mientras que las instalaciones y migraciones guiadas permanecen en 8.2–8.5.
+
+## Actualización segura de Nginx
+
+DevLab Manager respeta el repositorio y la rama Nginx que ya administra el VPS. No sustituye automáticamente los paquetes de Debian por los de `nginx.org`: Debian puede aplicar correcciones mediante backports sin adoptar el mismo número de versión upstream. Como referencia, Nginx publicó las versiones 1.30.7 estable y 1.31.9 mainline el 18 de noviembre de 2026 para corregir múltiples vulnerabilidades; consulta las [noticias](https://nginx.org/news.html) y los [avisos de seguridad oficiales](https://nginx.org/en/security_advisories.html).
+
+Si el binario Nginx no pertenece a ningún paquete `dpkg` —por ejemplo, fue compilado manualmente— la auditoría lo marca como no administrado y el actualizador se detiene. No intenta reemplazarlo ni afirmar que está parcheado sin conocer su origen.
+
+La opción 20 aplica este flujo:
+
+1. Comprueba la configuración existente con `nginx -t` y cancela sin modificar paquetes si ya es inválida.
+2. Actualiza los índices APT, enumera exactamente qué paquetes y módulos cambiarán y simula la resolución antes de tocar el sistema.
+3. Crea un archivo `tar.gz` de `/etc/nginx` con permisos `0600` y verifica su integridad.
+4. Conserva archivos de configuración locales durante la actualización.
+5. Valida nuevamente la configuración, reinicia Nginx solo si estaba activo y verifica su estado.
+6. Si falla, intenta restaurar las versiones anteriores de los paquetes y la configuración respaldada.
+
+El rollback de paquetes depende de que APT todavía pueda obtener las versiones anteriores. Si el repositorio ya las retiró, el script conserva el respaldo, mantiene abierta la ruta de recuperación manual y muestra los comandos de diagnóstico. Por eso, en producción sigue siendo recomendable crear antes un snapshot del proveedor.
 
 ## Modelo de seguridad de los sitios
 
@@ -188,6 +210,7 @@ Mantén siempre una segunda terminal conectada y una consola alternativa del pro
 
 - Backups SQL: `/var/backups/mysql` o `/var/backups/mariadb`.
 - Sitios sustituidos durante clone: `/var/backups/devlab/sites`.
+- Configuración previa a una actualización Nginx: `/var/backups/devlab/nginx` (`root:root`, directorio `0700`, archivos `0600`).
 - Backups de configuraciones: sufijo `.bak.<fecha-hora>` junto al archivo original.
 - No subas `.env`, claves privadas, dumps SQL ni configuraciones con tokens a GitHub.
 - Los backups locales no sustituyen una copia cifrada fuera del VPS.
@@ -201,12 +224,14 @@ sudo systemctl --failed
 sudo ufw status verbose
 sudo fail2ban-client -t
 sudo fail2ban-client status
+nginx -v
+apt-cache policy nginx
 curl -I https://tu-dominio.cl
 curl -I https://tu-dominio.cl/.env    # debe responder 403 o 404
 apt-cache policy php8.4-fpm
 ```
 
-También ejecuta **Stack Web → 15 (Auditoría de seguridad PHP)** y **Seguridad → Auditoría de seguridad**, y revisa manualmente los logs del primer despliegue.
+También ejecuta **Stack Web → 15 (Auditoría de seguridad PHP)**, **Stack Web → 19 (Auditoría de seguridad Nginx)** y **Seguridad → Auditoría de seguridad**, y revisa manualmente los logs del primer despliegue.
 
 ## Alcance y limitaciones
 
